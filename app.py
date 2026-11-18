@@ -1,660 +1,184 @@
-
 import os
+import json
 import sqlite3
 import hashlib
 import secrets
-import json
-from datetime import date, datetime
+import hmac
+from datetime import datetime, date
 from io import BytesIO
+import wave
+import time
 
 import streamlit as st
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
-# ==================================================
-# CARELOOP CONFIGURATION
-# ==================================================
+# ============================================================
+# CARELOOP — complete single-file Streamlit application
+# ============================================================
 
 st.set_page_config(
     page_title="Careloop",
     page_icon="💜",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-DB = "careloop.db"
-CHAT_MODEL = "gpt-6-luna"
-TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
-TTS_MODEL = "gpt-4o-mini-tts"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "careloop.db")
+CHAT_MODEL = os.getenv("CARELOOP_GEMINI_MODEL", "gemini-3.5-flash-lite")
+TTS_MODEL = os.getenv("CARELOOP_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+# Gemini handles text, transcription and spoken replies; no OpenAI client is used.
 
-LANGUAGES = {
-    "English": "English",
-    "ಕನ್ನಡ (Kannada)": "Kannada",
-    "हिन्दी (Hindi)": "Hindi",
-    "தமிழ் (Tamil)": "Tamil",
-    "తెలుగు (Telugu)": "Telugu",
-    "മലയാളം (Malayalam)": "Malayalam",
-    "বাংলা (Bengali)": "Bengali",
-    "मराठी (Marathi)": "Marathi",
-    "ગુજરાતી (Gujarati)": "Gujarati",
-    "ਪੰਜਾਬੀ (Punjabi)": "Punjabi",
-    "العربية (Arabic)": "Arabic",
-    "Français (French)": "French",
-    "Español (Spanish)": "Spanish",
-    "Deutsch (German)": "German",
-    "日本語 (Japanese)": "Japanese"
-}
+# 15 carefully selected language choices. English is the fallback language.
+# Translations are cached in memory and SQLite after the first successful request.
+LANGUAGES = [
+    "English", "Kannada", "Hindi", "Tamil", "Telugu", "Malayalam",
+    "Bengali", "Marathi", "Gujarati", "Punjabi", "Arabic",
+    "French", "Spanish", "German", "Japanese",
+]
 
-# ==================================================
-# TRANSLATIONS
-# ==================================================
-
-# Each language has the same translation keys.
-# If a translation is missing, English is used as fallback.
-
-ENGLISH = {
+# Stable translation keys. Keep values in English; translation is generated
+# once per language and stored in the translation_cache table.
+UI_EN = {
+    "app_tagline": "Your AI companion. Your everyday care.",
     "dashboard": "Dashboard",
     "companion": "AI Companion",
     "quiz": "Quick Quiz",
     "reminders": "Reminders",
     "profile": "Profile",
+    "user_management": "User Management",
     "logout": "Log out",
-    "language": "Choose language",
-    "menu": "Menu",
     "welcome": "Your everyday care starts here.",
-    "companion_desc": "Talk, ask questions and get support.",
-    "quiz_desc": "Learn something new every day.",
-    "reminder_desc": "Keep track of important tasks.",
-    "send": "Send",
+    "language": "App language",
+    "login": "Log in",
+    "register": "Create account",
+    "email": "Email",
+    "password": "Password",
+    "name": "Your name",
+    "password_hint": "Password (at least 8 characters)",
+    "login_error": "Email or password is incorrect.",
+    "register_success": "Account created. You can now log in.",
+    "register_invalid": "Enter a name and a valid email address.",
+    "register_password_short": "Use a password with at least 8 characters.",
+    "duplicate_email": "An account with this email already exists.",
+    "auth_intro_title": "A little support, whenever you need it.",
+    "auth_intro": "Chat with your AI companion, practise with quick quizzes, and keep track of everyday reminders.",
+    "voice_feature": "Voice input and spoken replies",
+    "ai_feature": "AI-powered conversations",
+    "reminder_feature": "Simple reminders",
+    "medical_notice": "Careloop is an AI tool, not a medical or emergency service.",
+    "choose_page": "Choose a page from the sidebar.",
+    "chat_title": "Talk to your companion",
+    "chat_caption": "AI-generated replies. Avoid sharing passwords, financial details, or highly sensitive personal information.",
     "message": "Type your message...",
+    "send": "Send",
     "thinking": "Careloop is thinking...",
-    "speak": "Speak to Careloop",
-    "record": "Record your voice",
-    "transcribe": "Transcribe and send",
-    "listening": "Listening...",
-    "hear": "Hear Careloop speak",
-    "generate_voice": "Generate spoken reply",
+    "ai_error": "The AI request failed",
+    "voice": "Speak to Careloop",
+    "voice_help": "Allow microphone access when your browser asks.",
+    "record": "Record a message",
+    "transcribe_send": "Transcribe and send voice message",
+    "listening": "Listening to your recording...",
+    "no_speech": "No speech was detected. Try recording again.",
+    "voice_error": "Voice transcription failed",
+    "recognized": "Recognised speech",
+    "read_reply": "Read the reply aloud",
+    "generate_speech": "Generate spoken reply",
+    "generating_voice": "Generating voice...",
+    "speech_error": "Could not generate speech",
+    "audio_note": "AI-generated voice. If your browser blocks autoplay, press Play.",
     "clear_chat": "Clear conversation",
-    "topic": "What topic would you like to practise?",
+    "quiz_topic": "Quiz topic",
+    "quiz_topic_hint": "For example: healthy habits, science, English vocabulary",
     "difficulty": "Difficulty",
     "easy": "Easy",
     "medium": "Medium",
     "hard": "Hard",
     "generate_quiz": "Generate quiz",
+    "enter_topic": "Enter a topic first.",
+    "creating_quiz": "Creating your quiz...",
+    "quiz_error": "Could not create quiz",
+    "choose_answer": "Choose one answer",
     "check_answers": "Check answers",
-    "choose_answer": "Choose an answer",
-    "score": "Your score",
-    "reminder": "Reminder",
+    "correct": "Correct",
+    "correct_answer": "Correct answer",
+    "score": "Score",
+    "reminder_title": "Reminder",
     "date": "Date",
     "add_reminder": "Add reminder",
+    "reminder_saved": "Reminder saved.",
+    "enter_reminder": "Enter a reminder.",
     "delete": "Delete",
     "no_reminders": "No reminders yet.",
-    "saved": "Reminder saved.",
-    "name": "Name",
-    "email": "Email",
-    "login": "Login",
-    "register": "Register",
-    "password": "Password",
-    "create_account": "Create account",
-    "logout_confirm": "Log out",
-    "welcome_back": "Welcome back",
-    "incorrect_login": "Incorrect email or password.",
-    "enter_topic": "Enter a topic.",
-    "correct": "Correct!",
-    "your_name": "Your name",
-    "chat_caption": "Chat with Careloop using text or your microphone.",
-    "microphone_caption": "Allow microphone access when your browser asks.",
-    "profile_info": "Your account information",
-    "account_created": "Account created successfully. You can now log in.",
-    "email_exists": "This email is already registered. Please log in.",
-    "valid_details": "Enter a valid name and email.",
-    "password_length": "Password must have at least 8 characters.",
-    "no_speech": "No speech detected.",
-    "api_missing": "OpenAI API key not found. Check .streamlit/secrets.toml.",
-    "login_first": "Please log in to continue."
+    "save_profile": "Save profile",
+    "language_updated": "Language preference updated.",
+    "total_users": "Total registered users",
+    "registered_users": "Registered users",
+    "registration_date": "Registration date",
+    "not_available": "Not available",
+    "no_users": "No users have registered yet.",
+    "creator_access": "Creator access",
+    "creator_code": "Creator access code",
+    "enter_creator": "Enter as Creator",
+    "wrong_creator_code": "Incorrect creator access code.",
+    "creator_config_missing": "Creator access is not configured. Add the creator settings to Streamlit Secrets.",
+    "creator_only": "This page is available only to the creator.",
+    "hello": "Hello",
+    "dashboard_companion": "Ask questions, think things through, or just talk.",
+    "dashboard_quiz": "Generate a short learning or wellbeing quiz.",
+    "dashboard_reminders": "Keep important tasks and dates in one place.",
+    "difficulty_help": "Choose quiz difficulty",
+    "delete_confirmed": "Reminder deleted.",
+    "api_key_missing": "Gemini API key not found. Add GEMINI_API_KEY to Streamlit Secrets.",
+    "translation_error": "Could not translate the interface. Showing English for now.",
+    "translation_wait": "Preparing the selected language...",
+    "profile_name": "Name",
+    "profile_email": "Email",
+    "creator_badge": "Creator",
+    "logout_confirm": "You have been logged out.",
 }
 
-TRANSLATIONS = {
-    "English": ENGLISH,
-
-    "Kannada": {
-        **ENGLISH,
-        "dashboard": "ಮುಖಪುಟ",
-        "companion": "AI ಸಹಾಯಕ",
-        "quiz": "ತ್ವರಿತ ರಸಪ್ರಶ್ನೆ",
-        "reminders": "ಜ್ಞಾಪನೆಗಳು",
-        "profile": "ಪ್ರೊಫೈಲ್",
-        "logout": "ಲಾಗ್ ಔಟ್",
-        "language": "ಭಾಷೆಯನ್ನು ಆಯ್ಕೆಮಾಡಿ",
-        "menu": "ಮೆನು",
-        "welcome": "ನಿಮ್ಮ ದೈನಂದಿನ ಆರೈಕೆ ಇಲ್ಲಿಂದ ಪ್ರಾರಂಭವಾಗುತ್ತದೆ.",
-        "send": "ಕಳುಹಿಸಿ",
-        "message": "ನಿಮ್ಮ ಸಂದೇಶವನ್ನು ಬರೆಯಿರಿ...",
-        "thinking": "Careloop ಯೋಚಿಸುತ್ತಿದೆ...",
-        "speak": "Careloop ಜೊತೆ ಮಾತನಾಡಿ",
-        "record": "ನಿಮ್ಮ ಧ್ವನಿಯನ್ನು ರೆಕಾರ್ಡ್ ಮಾಡಿ",
-        "transcribe": "ಪಠ್ಯವಾಗಿ ಪರಿವರ್ತಿಸಿ ಮತ್ತು ಕಳುಹಿಸಿ",
-        "generate_quiz": "ರಸಪ್ರಶ್ನೆ ರಚಿಸಿ",
-        "difficulty": "ಕಷ್ಟದ ಮಟ್ಟ",
-        "easy": "ಸುಲಭ",
-        "medium": "ಮಧ್ಯಮ",
-        "hard": "ಕಠಿಣ",
-        "reminder": "ಜ್ಞಾಪನೆ",
-        "date": "ದಿನಾಂಕ",
-        "add_reminder": "ಜ್ಞಾಪನೆ ಸೇರಿಸಿ",
-        "delete": "ಅಳಿಸಿ",
-        "no_reminders": "ಇನ್ನೂ ಯಾವುದೇ ಜ್ಞಾಪನೆಗಳಿಲ್ಲ.",
-        "saved": "ಜ್ಞಾಪನೆ ಉಳಿಸಲಾಗಿದೆ.",
-        "name": "ಹೆಸರು",
-        "email": "ಇಮೇಲ್",
-        "login": "ಲಾಗಿನ್",
-        "register": "ನೋಂದಣಿ",
-        "password": "ಪಾಸ್‌ವರ್ಡ್",
-        "create_account": "ಖಾತೆ ರಚಿಸಿ",
-        "correct": "ಸರಿಯಾಗಿದೆ!",
-        "choose_answer": "ಉತ್ತರವನ್ನು ಆಯ್ಕೆಮಾಡಿ",
-        "check_answers": "ಉತ್ತರಗಳನ್ನು ಪರಿಶೀಲಿಸಿ",
-        "score": "ನಿಮ್ಮ ಅಂಕ",
-        "your_name": "ನಿಮ್ಮ ಹೆಸರು",
-        "account_created": "ಖಾತೆ ಯಶಸ್ವಿಯಾಗಿ ರಚಿಸಲಾಗಿದೆ.",
-        "enter_topic": "ಒಂದು ವಿಷಯವನ್ನು ನಮೂದಿಸಿ."
-    },
-
-    "Hindi": {
-        **ENGLISH,
-        "dashboard": "डैशबोर्ड",
-        "companion": "AI साथी",
-        "quiz": "क्विज़",
-        "reminders": "रिमाइंडर",
-        "profile": "प्रोफ़ाइल",
-        "logout": "लॉग आउट",
-        "language": "भाषा चुनें",
-        "menu": "मेनू",
-        "welcome": "आपकी रोज़मर्रा की देखभाल यहीं से शुरू होती है।",
-        "send": "भेजें",
-        "message": "अपना संदेश लिखें...",
-        "thinking": "Careloop सोच रहा है...",
-        "speak": "Careloop से बात करें",
-        "record": "अपनी आवाज़ रिकॉर्ड करें",
-        "transcribe": "लिखित रूप में बदलें और भेजें",
-        "generate_quiz": "क्विज़ बनाएँ",
-        "difficulty": "कठिनाई",
-        "easy": "आसान",
-        "medium": "मध्यम",
-        "hard": "कठिन",
-        "reminder": "रिमाइंडर",
-        "date": "तारीख",
-        "add_reminder": "रिमाइंडर जोड़ें",
-        "delete": "हटाएँ",
-        "no_reminders": "अभी कोई रिमाइंडर नहीं है।",
-        "saved": "रिमाइंडर सेव हो गया।",
-        "name": "नाम",
-        "email": "ईमेल",
-        "login": "लॉगिन",
-        "register": "रजिस्टर",
-        "password": "पासवर्ड",
-        "create_account": "खाता बनाएँ",
-        "correct": "सही!",
-        "choose_answer": "उत्तर चुनें",
-        "check_answers": "उत्तर जाँचें",
-        "score": "आपका स्कोर",
-        "your_name": "आपका नाम",
-        "account_created": "खाता सफलतापूर्वक बनाया गया।",
-        "enter_topic": "एक विषय दर्ज करें।"
-    },
-
-    "Tamil": {
-        **ENGLISH,
-        "dashboard": "முகப்பு",
-        "companion": "AI துணைவர்",
-        "quiz": "வினாடி வினா",
-        "reminders": "நினைவூட்டல்கள்",
-        "profile": "சுயவிவரம்",
-        "logout": "வெளியேறு",
-        "language": "மொழியைத் தேர்ந்தெடுக்கவும்",
-        "menu": "மெனு",
-        "welcome": "உங்கள் அன்றாட பராமரிப்பு இங்கே தொடங்குகிறது.",
-        "send": "அனுப்பு",
-        "message": "உங்கள் செய்தியை எழுதுங்கள்...",
-        "thinking": "Careloop யோசிக்கிறது...",
-        "speak": "Careloop உடன் பேசுங்கள்",
-        "record": "உங்கள் குரலைப் பதிவு செய்யுங்கள்",
-        "generate_quiz": "வினாடி வினாவை உருவாக்கு",
-        "difficulty": "கடின நிலை",
-        "easy": "எளிது",
-        "medium": "நடுத்தரம்",
-        "hard": "கடினம்",
-        "reminder": "நினைவூட்டல்",
-        "date": "தேதி",
-        "add_reminder": "நினைவூட்டலைச் சேர்",
-        "delete": "நீக்கு",
-        "no_reminders": "நினைவூட்டல்கள் எதுவும் இல்லை.",
-        "saved": "நினைவூட்டல் சேமிக்கப்பட்டது.",
-        "name": "பெயர்",
-        "email": "மின்னஞ்சல்",
-        "login": "உள்நுழை",
-        "register": "பதிவு செய்",
-        "password": "கடவுச்சொல்",
-        "create_account": "கணக்கை உருவாக்கு",
-        "correct": "சரி!",
-        "choose_answer": "பதிலைத் தேர்ந்தெடுக்கவும்",
-        "check_answers": "பதில்களைச் சரிபார்க்கவும்",
-        "score": "உங்கள் மதிப்பெண்"
-    },
-
-    "Telugu": {
-        **ENGLISH,
-        "dashboard": "డాష్‌బోర్డ్",
-        "companion": "AI సహచరుడు",
-        "quiz": "క్విజ్",
-        "reminders": "రిమైండర్లు",
-        "profile": "ప్రొఫైల్",
-        "logout": "లాగ్ అవుట్",
-        "language": "భాషను ఎంచుకోండి",
-        "menu": "మెనూ",
-        "welcome": "మీ రోజువారీ సంరక్షణ ఇక్కడ ప్రారంభమవుతుంది.",
-        "send": "పంపండి",
-        "message": "మీ సందేశాన్ని రాయండి...",
-        "thinking": "Careloop ఆలోచిస్తోంది...",
-        "speak": "Careloopతో మాట్లాడండి",
-        "record": "మీ వాయిస్‌ను రికార్డ్ చేయండి",
-        "generate_quiz": "క్విజ్ రూపొందించండి",
-        "difficulty": "కఠినత",
-        "easy": "సులభం",
-        "medium": "మధ్యస్థం",
-        "hard": "కష్టం",
-        "reminder": "రిమైండర్",
-        "date": "తేదీ",
-        "add_reminder": "రిమైండర్ జోడించండి",
-        "delete": "తొలగించండి",
-        "no_reminders": "ఇంకా రిమైండర్లు లేవు.",
-        "saved": "రిమైండర్ సేవ్ చేయబడింది.",
-        "name": "పేరు",
-        "email": "ఇమెయిల్",
-        "login": "లాగిన్",
-        "register": "నమోదు",
-        "password": "పాస్‌వర్డ్",
-        "create_account": "ఖాతా సృష్టించండి"
-    },
-
-    "Malayalam": {
-        **ENGLISH,
-        "dashboard": "ഡാഷ്ബോർഡ്",
-        "companion": "AI കൂട്ടുകാരൻ",
-        "quiz": "ക്വിസ്",
-        "reminders": "ഓർമ്മപ്പെടുത്തലുകൾ",
-        "profile": "പ്രൊഫൈൽ",
-        "logout": "ലോഗ് ഔട്ട്",
-        "language": "ഭാഷ തിരഞ്ഞെടുക്കുക",
-        "menu": "മെനു",
-        "welcome": "നിങ്ങളുടെ ദൈനംദിന പരിചരണം ഇവിടെ ആരംഭിക്കുന്നു.",
-        "send": "അയയ്ക്കുക",
-        "message": "നിങ്ങളുടെ സന്ദേശം എഴുതുക...",
-        "thinking": "Careloop ചിന്തിക്കുന്നു...",
-        "generate_quiz": "ക്വിസ് സൃഷ്ടിക്കുക",
-        "difficulty": "കാഠിന്യം",
-        "easy": "എളുപ്പം",
-        "medium": "ഇടത്തരം",
-        "hard": "കഠിനം",
-        "reminder": "ഓർമ്മപ്പെടുത്തൽ",
-        "date": "തീയതി",
-        "add_reminder": "ഓർമ്മപ്പെടുത്തൽ ചേർക്കുക",
-        "delete": "ഇല്ലാതാക്കുക",
-        "no_reminders": "ഓർമ്മപ്പെടുത്തലുകൾ ഒന്നുമില്ല.",
-        "name": "പേര്",
-        "email": "ഇമെയിൽ",
-        "login": "ലോഗിൻ",
-        "register": "രജിസ്റ്റർ",
-        "password": "പാസ്‌വേഡ്",
-        "create_account": "അക്കൗണ്ട് സൃഷ്ടിക്കുക"
-    },
-
-    "Bengali": {
-        **ENGLISH,
-        "dashboard": "ড্যাশবোর্ড",
-        "companion": "AI সঙ্গী",
-        "quiz": "কুইজ",
-        "reminders": "রিমাইন্ডার",
-        "profile": "প্রোফাইল",
-        "logout": "লগ আউট",
-        "language": "ভাষা নির্বাচন করুন",
-        "menu": "মেনু",
-        "welcome": "আপনার দৈনন্দিন যত্ন এখান থেকে শুরু হয়।",
-        "send": "পাঠান",
-        "message": "আপনার বার্তা লিখুন...",
-        "thinking": "Careloop ভাবছে...",
-        "generate_quiz": "কুইজ তৈরি করুন",
-        "difficulty": "কঠিনতা",
-        "easy": "সহজ",
-        "medium": "মাঝারি",
-        "hard": "কঠিন",
-        "reminder": "রিমাইন্ডার",
-        "date": "তারিখ",
-        "add_reminder": "রিমাইন্ডার যোগ করুন",
-        "delete": "মুছুন",
-        "no_reminders": "এখনও কোনো রিমাইন্ডার নেই।",
-        "name": "নাম",
-        "email": "ইমেইল",
-        "login": "লগইন",
-        "register": "নিবন্ধন",
-        "password": "পাসওয়ার্ড",
-        "create_account": "অ্যাকাউন্ট তৈরি করুন"
-    },
-
-    "Marathi": {
-        **ENGLISH,
-        "dashboard": "डॅशबोर्ड",
-        "companion": "AI साथी",
-        "quiz": "प्रश्नमंजुषा",
-        "reminders": "स्मरणपत्रे",
-        "profile": "प्रोफाइल",
-        "logout": "बाहेर पडा",
-        "language": "भाषा निवडा",
-        "menu": "मेनू",
-        "welcome": "तुमची दैनंदिन काळजी इथून सुरू होते.",
-        "send": "पाठवा",
-        "message": "तुमचा संदेश लिहा...",
-        "thinking": "Careloop विचार करत आहे...",
-        "generate_quiz": "प्रश्नमंजुषा तयार करा",
-        "difficulty": "कठीणपणा",
-        "easy": "सोपा",
-        "medium": "मध्यम",
-        "hard": "कठीण",
-        "reminder": "स्मरणपत्र",
-        "date": "तारीख",
-        "add_reminder": "स्मरणपत्र जोडा",
-        "delete": "हटवा",
-        "no_reminders": "अद्याप स्मरणपत्रे नाहीत.",
-        "name": "नाव",
-        "email": "ईमेल",
-        "login": "लॉगिन",
-        "register": "नोंदणी",
-        "password": "पासवर्ड",
-        "create_account": "खाते तयार करा"
-    },
-
-    "Gujarati": {
-        **ENGLISH,
-        "dashboard": "ડેશબોર્ડ",
-        "companion": "AI સાથી",
-        "quiz": "ક્વિઝ",
-        "reminders": "રીમાઇન્ડર્સ",
-        "profile": "પ્રોફાઇલ",
-        "logout": "લૉગ આઉટ",
-        "language": "ભાષા પસંદ કરો",
-        "menu": "મેનૂ",
-        "welcome": "તમારી દૈનિક સંભાળ અહીંથી શરૂ થાય છે.",
-        "send": "મોકલો",
-        "message": "તમારો સંદેશ લખો...",
-        "thinking": "Careloop વિચારી રહ્યું છે...",
-        "generate_quiz": "ક્વિઝ બનાવો",
-        "difficulty": "કઠિનતા",
-        "easy": "સરળ",
-        "medium": "મધ્યમ",
-        "hard": "અઘરું",
-        "reminder": "રિમાઇન્ડર",
-        "date": "તારીખ",
-        "add_reminder": "રિમાઇન્ડર ઉમેરો",
-        "delete": "કાઢી નાખો",
-        "name": "નામ",
-        "email": "ઇમેઇલ",
-        "login": "લૉગિન",
-        "register": "નોંધણી",
-        "password": "પાસવર્ડ",
-        "create_account": "ખાતું બનાવો"
-    },
-
-    "Punjabi": {
-        **ENGLISH,
-        "dashboard": "ਡੈਸ਼ਬੋਰਡ",
-        "companion": "AI ਸਾਥੀ",
-        "quiz": "ਕੁਇਜ਼",
-        "reminders": "ਯਾਦ-ਦਿਹਾਨੀਆਂ",
-        "profile": "ਪ੍ਰੋਫ਼ਾਈਲ",
-        "logout": "ਲੌਗ ਆਉਟ",
-        "language": "ਭਾਸ਼ਾ ਚੁਣੋ",
-        "menu": "ਮੀਨੂ",
-        "welcome": "ਤੁਹਾਡੀ ਰੋਜ਼ਾਨਾ ਦੇਖਭਾਲ ਇੱਥੋਂ ਸ਼ੁਰੂ ਹੁੰਦੀ ਹੈ।",
-        "send": "ਭੇਜੋ",
-        "message": "ਆਪਣਾ ਸੁਨੇਹਾ ਲਿਖੋ...",
-        "thinking": "Careloop ਸੋਚ ਰਿਹਾ ਹੈ...",
-        "generate_quiz": "ਕੁਇਜ਼ ਬਣਾਓ",
-        "difficulty": "ਮੁਸ਼ਕਲ",
-        "easy": "ਸੌਖਾ",
-        "medium": "ਦਰਮਿਆਨਾ",
-        "hard": "ਔਖਾ",
-        "reminder": "ਯਾਦ-ਦਿਹਾਨੀ",
-        "date": "ਤਾਰੀਖ",
-        "add_reminder": "ਯਾਦ-ਦਿਹਾਨੀ ਸ਼ਾਮਲ ਕਰੋ",
-        "delete": "ਮਿਟਾਓ",
-        "name": "ਨਾਮ",
-        "email": "ਈਮੇਲ",
-        "login": "ਲੌਗਇਨ",
-        "register": "ਰਜਿਸਟਰ",
-        "password": "ਪਾਸਵਰਡ",
-        "create_account": "ਖਾਤਾ ਬਣਾਓ"
-    },
-
-    "Arabic": {
-        **ENGLISH,
-        "dashboard": "لوحة التحكم",
-        "companion": "رفيق الذكاء الاصطناعي",
-        "quiz": "اختبار سريع",
-        "reminders": "التذكيرات",
-        "profile": "الملف الشخصي",
-        "logout": "تسجيل الخروج",
-        "language": "اختر اللغة",
-        "menu": "القائمة",
-        "welcome": "تبدأ رعايتك اليومية من هنا.",
-        "send": "إرسال",
-        "message": "اكتب رسالتك...",
-        "thinking": "Careloop يفكر...",
-        "generate_quiz": "إنشاء اختبار",
-        "difficulty": "مستوى الصعوبة",
-        "easy": "سهل",
-        "medium": "متوسط",
-        "hard": "صعب",
-        "reminder": "تذكير",
-        "date": "التاريخ",
-        "add_reminder": "إضافة تذكير",
-        "delete": "حذف",
-        "name": "الاسم",
-        "email": "البريد الإلكتروني",
-        "login": "تسجيل الدخول",
-        "register": "تسجيل",
-        "password": "كلمة المرور",
-        "create_account": "إنشاء حساب"
-    },
-
-    "French": {
-        **ENGLISH,
-        "dashboard": "Tableau de bord",
-        "companion": "Compagnon IA",
-        "quiz": "Quiz rapide",
-        "reminders": "Rappels",
-        "profile": "Profil",
-        "logout": "Déconnexion",
-        "language": "Choisir la langue",
-        "menu": "Menu",
-        "welcome": "Votre bien-être quotidien commence ici.",
-        "send": "Envoyer",
-        "message": "Écrivez votre message...",
-        "thinking": "Careloop réfléchit...",
-        "generate_quiz": "Créer un quiz",
-        "difficulty": "Difficulté",
-        "easy": "Facile",
-        "medium": "Moyen",
-        "hard": "Difficile",
-        "reminder": "Rappel",
-        "date": "Date",
-        "add_reminder": "Ajouter un rappel",
-        "delete": "Supprimer",
-        "no_reminders": "Aucun rappel pour le moment.",
-        "saved": "Rappel enregistré.",
-        "name": "Nom",
-        "email": "E-mail",
-        "login": "Connexion",
-        "register": "Inscription",
-        "password": "Mot de passe",
-        "create_account": "Créer un compte"
-    },
-
-    "Spanish": {
-        **ENGLISH,
-        "dashboard": "Panel",
-        "companion": "Compañero de IA",
-        "quiz": "Prueba rápida",
-        "reminders": "Recordatorios",
-        "profile": "Perfil",
-        "logout": "Cerrar sesión",
-        "language": "Elegir idioma",
-        "menu": "Menú",
-        "welcome": "Tu cuidado diario comienza aquí.",
-        "send": "Enviar",
-        "message": "Escribe tu mensaje...",
-        "thinking": "Careloop está pensando...",
-        "generate_quiz": "Crear prueba",
-        "difficulty": "Dificultad",
-        "easy": "Fácil",
-        "medium": "Medio",
-        "hard": "Difícil",
-        "reminder": "Recordatorio",
-        "date": "Fecha",
-        "add_reminder": "Añadir recordatorio",
-        "delete": "Eliminar",
-        "no_reminders": "Todavía no hay recordatorios.",
-        "saved": "Recordatorio guardado.",
-        "name": "Nombre",
-        "email": "Correo electrónico",
-        "login": "Iniciar sesión",
-        "register": "Registrarse",
-        "password": "Contraseña",
-        "create_account": "Crear cuenta"
-    },
-
-    "German": {
-        **ENGLISH,
-        "dashboard": "Dashboard",
-        "companion": "KI-Begleiter",
-        "quiz": "Schnellquiz",
-        "reminders": "Erinnerungen",
-        "profile": "Profil",
-        "logout": "Abmelden",
-        "language": "Sprache auswählen",
-        "menu": "Menü",
-        "welcome": "Ihre tägliche Betreuung beginnt hier.",
-        "send": "Senden",
-        "message": "Nachricht schreiben...",
-        "thinking": "Careloop denkt nach...",
-        "generate_quiz": "Quiz erstellen",
-        "difficulty": "Schwierigkeit",
-        "easy": "Einfach",
-        "medium": "Mittel",
-        "hard": "Schwer",
-        "reminder": "Erinnerung",
-        "date": "Datum",
-        "add_reminder": "Erinnerung hinzufügen",
-        "delete": "Löschen",
-        "no_reminders": "Noch keine Erinnerungen.",
-        "saved": "Erinnerung gespeichert.",
-        "name": "Name",
-        "email": "E-Mail",
-        "login": "Anmelden",
-        "register": "Registrieren",
-        "password": "Passwort",
-        "create_account": "Konto erstellen"
-    },
-
-    "Japanese": {
-        **ENGLISH,
-        "dashboard": "ダッシュボード",
-        "companion": "AIコンパニオン",
-        "quiz": "クイズ",
-        "reminders": "リマインダー",
-        "profile": "プロフィール",
-        "logout": "ログアウト",
-        "language": "言語を選択",
-        "menu": "メニュー",
-        "welcome": "毎日のケアはここから始まります。",
-        "send": "送信",
-        "message": "メッセージを入力...",
-        "thinking": "Careloopが考えています...",
-        "generate_quiz": "クイズを作成",
-        "difficulty": "難易度",
-        "easy": "簡単",
-        "medium": "普通",
-        "hard": "難しい",
-        "reminder": "リマインダー",
-        "date": "日付",
-        "add_reminder": "リマインダーを追加",
-        "delete": "削除",
-        "no_reminders": "リマインダーはまだありません。",
-        "saved": "リマインダーを保存しました。",
-        "name": "名前",
-        "email": "メールアドレス",
-        "login": "ログイン",
-        "register": "登録",
-        "password": "パスワード",
-        "create_account": "アカウントを作成"
-    }
+LANGUAGE_NATIVE = {
+    "English": "English", "Kannada": "ಕನ್ನಡ", "Hindi": "हिन्दी",
+    "Tamil": "தமிழ்", "Telugu": "తెలుగు", "Malayalam": "മലയാളം",
+    "Bengali": "বাংলা", "Marathi": "मराठी", "Gujarati": "ગુજરાતી",
+    "Punjabi": "ਪੰਜਾਬੀ", "Arabic": "العربية", "French": "Français",
+    "Spanish": "Español", "German": "Deutsch", "Japanese": "日本語",
 }
 
 
-def t(key):
-    language = st.session_state.get("language", "English")
-    return TRANSLATIONS.get(language, ENGLISH).get(key, ENGLISH.get(key, key))
+def db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
-def selected_ai_language():
-    return st.session_state.get("language", "English")
-
-
-# ==================================================
-# DATABASE
-# ==================================================
-
-def connection():
-    return sqlite3.connect(DB)
-
-
-def initialize_database():
-    with connection() as conn:
+def init_db():
+    with db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 email TEXT PRIMARY KEY,
-                name TEXT,
-                password_hash TEXT,
-                salt TEXT
+                name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                created_at TEXT
             )
         """)
+        # Upgrade older Careloop databases without deleting existing users.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        for column, declaration in [
+            ("name", "TEXT"),
+            ("password_hash", "TEXT"),
+            ("salt", "TEXT"),
+            ("created_at", "TEXT"),
+        ]:
+            if column not in cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} {declaration}")
+                cols.add(column)
 
-        columns = {
-            row[1] for row in
-            conn.execute("PRAGMA table_info(users)").fetchall()
-        }
-
-        if "password_hash" not in columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN password_hash TEXT"
-            )
-
-        if "salt" not in columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN salt TEXT"
-            )
-
-        if "name" not in columns:
-            conn.execute(
-                "ALTER TABLE users ADD COLUMN name TEXT"
-            )
-
-        columns = {
-            row[1] for row in
-            conn.execute("PRAGMA table_info(users)").fetchall()
-        }
-
-        if "password" in columns:
+        # Support older versions that used a `password` column.
+        if "password" in cols:
             conn.execute("""
-                UPDATE users
-                SET password_hash = password
+                UPDATE users SET password_hash = password
                 WHERE (password_hash IS NULL OR password_hash = '')
                   AND password IS NOT NULL
             """)
@@ -664,706 +188,726 @@ def initialize_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL,
                 title TEXT NOT NULL,
-                due_date TEXT NOT NULL
+                reminder_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # Migrate older Careloop reminder tables safely. Earlier versions used
+        # `due_date` instead of `reminder_date` and did not store `created_at`.
+        # Keep the old columns and all existing rows; add the newer columns.
+        reminder_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(reminders)").fetchall()
+        }
+        if "reminder_date" not in reminder_cols:
+            conn.execute("ALTER TABLE reminders ADD COLUMN reminder_date TEXT")
+            reminder_cols.add("reminder_date")
+        if "due_date" in reminder_cols:
+            conn.execute("""
+                UPDATE reminders
+                SET reminder_date = due_date
+                WHERE reminder_date IS NULL OR reminder_date = ''
+            """)
+        if "created_at" not in reminder_cols:
+            conn.execute("ALTER TABLE reminders ADD COLUMN created_at TEXT")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS translation_cache (
+                language TEXT PRIMARY KEY,
+                translations_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
         """)
 
 
 def hash_password(password, salt):
     return hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode(),
-        salt.encode(),
-        180000
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 180000
     ).hex()
 
 
-def register(name, email, password):
+def create_user(name, email, password):
     email = email.strip().lower()
     salt = secrets.token_hex(16)
     hashed = hash_password(password, salt)
-
-    with connection() as conn:
-        columns = {
-            row[1] for row in
-            conn.execute("PRAGMA table_info(users)").fetchall()
-        }
-
-        values = {
-            "email": email,
-            "name": name.strip(),
-            "password_hash": hashed,
-            "salt": salt
-        }
-
-        if "password" in columns:
-            values["password"] = hashed
-
-        if "created_at" in columns:
-            values["created_at"] = datetime.now().isoformat()
-
-        insert_columns = [
-            col for col in values if col in columns
-        ]
-
-        sql = (
-            f"INSERT INTO users ({','.join(insert_columns)}) "
-            f"VALUES ({','.join(['?'] * len(insert_columns))})"
-        )
-
-        conn.execute(
-            sql,
-            [values[col] for col in insert_columns]
-        )
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO users(email, name, password_hash, salt, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (email, name.strip(), hashed, salt, datetime.now().isoformat()))
 
 
-def login(email, password):
-    email = email.strip().lower()
-
-    with connection() as conn:
-        user = conn.execute("""
+def authenticate(email, password):
+    with db() as conn:
+        row = conn.execute("""
             SELECT email, name, password_hash, salt
-            FROM users
-            WHERE email = ?
-        """, (email,)).fetchone()
-
-    if not user:
+            FROM users WHERE email = ?
+        """, (email.strip().lower(),)).fetchone()
+    if not row or not row[2] or not row[3]:
         return None
-
-    stored_hash = user[2]
-    salt = user[3]
-
-    if not stored_hash or not salt:
-        return None
-
-    entered_hash = hash_password(password, salt)
-
-    if secrets.compare_digest(entered_hash, stored_hash):
-        return {
-            "email": user[0],
-            "name": user[1] or "Careloop User"
-        }
-
+    if hmac.compare_digest(hash_password(password, row[3]), row[2]):
+        return {"email": row[0], "name": row[1]}
     return None
 
 
-# ==================================================
-# OPENAI
-# ==================================================
-
 def get_client():
+    """Create the Gemini client from Streamlit Secrets or an environment variable."""
     try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
+        key = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
-        key = os.getenv("OPENAI_API_KEY", "")
-
-    if not key:
-        return None
-
-    return OpenAI(api_key=key)
+        key = ""
+    key = key or os.getenv("GEMINI_API_KEY", "")
+    return genai.Client(api_key=key) if key else None
 
 
-def ai_reply(client, history):
-    language = selected_ai_language()
-    name = st.session_state.user["name"]
+def get_translation(client, language):
+    """Load a cached translation first; call the configured model only on a cache miss."""
+    if language == "English":
+        return UI_EN
 
-    instructions = f"""
-You are Careloop, an intelligent everyday AI companion.
+    cache_key = f"ui_translations_{language}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
 
-The user's name is {name}.
-Respond in {language}, unless the user asks for another language.
+    # Existing translations from the earlier Careloop version are reused.
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT translations_json FROM translation_cache WHERE language=?",
+                (language,),
+            ).fetchone()
+        if row:
+            cached = json.loads(row[0])
+            if isinstance(cached, dict) and cached:
+                translated = {
+                    key: str(cached.get(key, value))
+                    for key, value in UI_EN.items()
+                }
+                st.session_state[cache_key] = translated
+                return translated
+    except Exception:
+        # A missing or damaged cache should not prevent a fresh translation.
+        pass
 
-Be conversational, friendly, helpful and honest.
-Keep answers easy to understand.
-Ask useful follow-up questions when appropriate.
+    if client is None:
+        st.error("Translation unavailable: GEMINI_API_KEY is not configured.")
+        return UI_EN
 
-You are an AI, not a human, doctor or therapist.
-Never diagnose medical conditions.
-For emergencies, recommend contacting local emergency services.
-"""
-
-    response = client.responses.create(
-        model=CHAT_MODEL,
-        instructions=instructions,
-        input=history
+    prompt = (
+        f"Translate every value in this JSON object into {language}. "
+        "Preserve every key exactly. Return only one valid JSON object, with no markdown. "
+        "Use short, natural wording for app buttons, labels and messages. "
+        "Keep Careloop and AI unchanged where appropriate. Do not add or remove keys. JSON:\n"
+        + json.dumps(UI_EN, ensure_ascii=False)
     )
 
-    return response.output_text.strip()
-
-
-def transcribe(client, recording):
-    audio = BytesIO(recording.getvalue())
-    audio.name = "recording.wav"
-
-    result = client.audio.transcriptions.create(
-        model=TRANSCRIPTION_MODEL,
-        file=audio
-    )
-
-    return result.text.strip()
-
-
-def generate_voice(client, text):
-    result = client.audio.speech.create(
-        model=TTS_MODEL,
-        voice="marin",
-        input=text[:4000],
-        instructions=(
-            "Speak naturally and clearly in the language of the text."
+    try:
+        response = client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=2600),
         )
+        raw = (response.text or "").strip()
+        if raw.startswith("```json"):
+            raw = raw[len("```json"):]
+        elif raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        translated_data = json.loads(raw.strip())
+        if not isinstance(translated_data, dict):
+            raise ValueError("The translation response was not a JSON object.")
+
+        translated = {
+            key: str(translated_data.get(key, value))
+            for key, value in UI_EN.items()
+        }
+
+        # Save once. Next language selection reads from session or SQLite,
+        # so it does not need another translation API request.
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO translation_cache(language, translations_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(language) DO UPDATE SET
+                     translations_json=excluded.translations_json,
+                     updated_at=excluded.updated_at""",
+                (language, json.dumps(translated, ensure_ascii=False), datetime.now().isoformat()),
+            )
+
+        st.session_state[cache_key] = translated
+        return translated
+
+    except Exception as exc:
+        # Show the actual API error so model access, quota and key problems
+        # can be distinguished instead of silently pretending translation ran.
+        st.error(f"Translation failed ({type(exc).__name__}): {exc}")
+        return UI_EN
+
+
+def tr(key):
+    translations = st.session_state.get("ui_translations", UI_EN)
+    return translations.get(key, UI_EN.get(key, key))
+
+
+def ask_ai(client, messages, language, name):
+    instructions = f"""
+You are Careloop, a friendly, thoughtful everyday AI companion.
+The user's name is {name}. Reply in {language}, unless the user clearly asks for another language.
+Be warm but honest, practical, concise, and age-appropriate.
+Do not claim to be a doctor, therapist, or emergency service. Do not diagnose.
+For urgent danger or serious symptoms, tell the user to contact local emergency services
+or a qualified professional. Do not invent facts. Never pretend to be human.
+"""
+    contents = []
+    for item in messages:
+        role = "model" if item.get("role") == "assistant" else "user"
+        contents.append(types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=str(item.get("content", "")))],
+        ))
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=instructions,
+            max_output_tokens=1200,
+        ),
     )
-
-    return result.content
-
-
-# ==================================================
-# DESIGN
-# ==================================================
-
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-
-html, body, [class*="css"] {
-    font-family: Inter, sans-serif;
-}
-
-.stApp {
-    background: linear-gradient(135deg,#f7f5ff,#eef2ff,#fff7fb);
-}
-
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg,#21124b,#49318d);
-}
-
-[data-testid="stSidebar"] * {
-    color: white !important;
-}
-
-.hero {
-    padding: 30px;
-    border-radius: 24px;
-    color: white;
-    background: linear-gradient(120deg,#5933ad,#8061df,#a17be8);
-    margin-bottom: 25px;
-    box-shadow: 0 10px 30px rgba(70,40,150,.15);
-}
-
-.hero h1 {
-    color: white;
-    font-size: 35px;
-}
-
-.hero p {
-    color: #f4edff;
-}
-
-.card {
-    background: white;
-    border: 1px solid #e8e2f7;
-    border-radius: 18px;
-    padding: 22px;
-    min-height: 125px;
-    box-shadow: 0 5px 18px rgba(50,35,100,.05);
-}
-
-.card h3 {
-    color: #5737a0;
-}
-
-div.stButton > button {
-    background: linear-gradient(90deg,#6544c3,#8b69dc);
-    color: white;
-    border: none;
-    border-radius: 12px;
-    font-weight: 650;
-}
-</style>
-""", unsafe_allow_html=True)
+    answer = (response.text or "").strip()
+    if not answer:
+        raise ValueError("Gemini returned an empty response.")
+    return answer
 
 
-# ==================================================
-# AUTHENTICATION
-# ==================================================
+def transcribe_audio(client, audio_file):
+    """Transcribe a Streamlit audio recording using Gemini audio understanding."""
+    audio_bytes = audio_file.getvalue()
+    mime_type = getattr(audio_file, "type", None) or "audio/wav"
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=[
+            types.Part.from_text(
+                text="Transcribe the spoken words accurately. Return only the transcript."
+            ),
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+        config=types.GenerateContentConfig(max_output_tokens=1200),
+    )
+    return (response.text or "").strip()
 
-def authentication_page():
 
+def make_speech(client, text_to_speak):
+    """Generate WAV audio with Gemini text-to-speech."""
+    response = client.models.generate_content(
+        model=TTS_MODEL,
+        contents=f"Speak clearly and naturally. Match the language of this text: {text_to_speak[:4000]}",
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore"
+                    )
+                )
+            ),
+        ),
+    )
+    audio_data = response.candidates[0].content.parts[0].inline_data.data
+    wav_buffer = BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(audio_data)
+    return wav_buffer.getvalue()
+
+
+def inject_css():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    html, body, [class*="css"] { font-family: Inter, sans-serif; }
+    .stApp { background: linear-gradient(135deg,#f7f5ff 0%,#f1f5ff 55%,#fff7fb 100%); }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg,#21124b,#3d287a); }
+    [data-testid="stSidebar"] * { color: white !important; }
+    .hero { padding:30px 32px; border-radius:24px; color:white;
+      background:linear-gradient(120deg,#5b35b5,#7860df 58%,#9b77e8);
+      box-shadow:0 12px 35px rgba(80,54,160,.18); margin-bottom:22px; }
+    .hero h1 { color:white; font-size:2.15rem; margin:0 0 8px 0; }
+    .hero p { color:#f2edff; font-size:1.03rem; margin:0; }
+    .mini-card { background:rgba(255,255,255,.9); border:1px solid #e9e4fa;
+      border-radius:18px; padding:20px; min-height:125px;
+      box-shadow:0 5px 18px rgba(50,35,100,.05); }
+    .mini-card h3 { margin:0 0 8px 0; color:#4b328e; }
+    .mini-card p { margin:0; color:#665f78; }
+    div.stButton > button { border-radius:12px; border:0; font-weight:650;
+      background:linear-gradient(90deg,#6544c3,#8b69dc); color:white; padding:.58rem 1.1rem; }
+    div.stButton > button:hover { color:white; border:0; filter:brightness(1.06); }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def auth_screen(client):
     st.markdown("""
     <div class="hero">
-        <h1>💜 Careloop</h1>
-        <p>Your AI companion. Your everyday care.</p>
+      <h1>💜 Careloop</h1>
+      <p>Your AI companion. Your everyday care.</p>
     </div>
     """, unsafe_allow_html=True)
-
-    left, right = st.columns(2)
-
+    left, right = st.columns([1.15, 1])
     with left:
-        st.markdown("## Your everyday companion")
-        st.write(
-            "Chat, learn, organise your day and get helpful support."
-        )
-        st.write("🌍 15 languages")
-        st.write("🎙️ Voice conversations")
-        st.write("🧠 AI-powered quizzes")
-        st.write("📅 Personal reminders")
+        st.markdown("## " + tr("auth_intro_title"))
+        st.write(tr("auth_intro"))
+        st.markdown(f"- 🌍 {len(LANGUAGES)} language options")
+        st.markdown("- 🎙️ " + tr("voice_feature"))
+        st.markdown("- 🧠 " + tr("ai_feature"))
+        st.markdown("- 📅 " + tr("reminder_feature"))
+        st.caption(tr("medical_notice"))
 
     with right:
-        tab1, tab2 = st.tabs([t("login"), t("register")])
-
-        with tab1:
-            email = st.text_input(t("email"), key="login_email")
-            password = st.text_input(
-                t("password"),
-                type="password",
-                key="login_password"
-            )
-
-            if st.button(t("login"), use_container_width=True):
-                user = login(email, password)
-
+        tab_login, tab_register = st.tabs([tr("login"), tr("register")])
+        with tab_login:
+            email = st.text_input(tr("email"), key="login_email")
+            password = st.text_input(tr("password"), type="password", key="login_password")
+            if st.button(tr("login"), use_container_width=True):
+                user = authenticate(email, password)
                 if user:
                     st.session_state.user = user
+                    st.session_state.is_creator = False
                     st.rerun()
                 else:
-                    st.error(t("incorrect_login"))
+                    st.error(tr("login_error"))
 
-        with tab2:
-            name = st.text_input(t("your_name"))
-            email = st.text_input(t("email"), key="register_email")
-            password = st.text_input(
-                t("password") + " (minimum 8 characters)",
-                type="password",
-                key="register_password"
-            )
-
-            if st.button(
-                t("create_account"),
-                use_container_width=True
-            ):
-                if not name.strip() or "@" not in email:
-                    st.error(t("valid_details"))
-                elif len(password) < 8:
-                    st.error(t("password_length"))
+        with tab_register:
+            name = st.text_input(tr("name"), key="register_name")
+            email_new = st.text_input(tr("email"), key="register_email")
+            password_new = st.text_input(tr("password_hint"), type="password", key="register_password")
+            if st.button(tr("register"), use_container_width=True):
+                if not name.strip() or not email_new.strip() or "@" not in email_new:
+                    st.error(tr("register_invalid"))
+                elif len(password_new) < 8:
+                    st.error(tr("register_password_short"))
                 else:
                     try:
-                        register(name, email, password)
-                        st.success(t("account_created"))
+                        create_user(name, email_new, password_new)
+                        st.success(tr("register_success"))
                     except sqlite3.IntegrityError:
-                        st.error(t("email_exists"))
-                    except Exception as error:
-                        st.error(f"Registration error: {error}")
-
-
-# ==================================================
-# DASHBOARD
-# ==================================================
-
-def dashboard():
-    name = st.session_state.user["name"]
-
-    st.markdown(f"""
-    <div class="hero">
-        <h1>Hello, {name} 👋</h1>
-        <p>{t("welcome")}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    a, b, c = st.columns(3)
-
-    with a:
-        st.markdown(f"""
-        <div class="card">
-            <h3>💬 {t("companion")}</h3>
-            <p>{t("companion_desc")}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with b:
-        st.markdown(f"""
-        <div class="card">
-            <h3>🧠 {t("quiz")}</h3>
-            <p>{t("quiz_desc")}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c:
-        st.markdown(f"""
-        <div class="card">
-            <h3>📅 {t("reminders")}</h3>
-            <p>{t("reminder_desc")}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-# ==================================================
-# AI COMPANION
-# ==================================================
-
-def companion_page(client):
-    st.title("💜 " + t("companion"))
-    st.caption(t("chat_caption"))
-
-    if "history" not in st.session_state:
-        st.session_state.history = []
-
-    for message in st.session_state.history:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-
-    with st.form("chat_form", clear_on_submit=True):
-        prompt = st.text_area(t("message"))
-        submitted = st.form_submit_button(t("send"))
-
-    if submitted and prompt.strip():
-        st.session_state.history.append({
-            "role": "user",
-            "content": prompt.strip()
-        })
-
-        with st.spinner(t("thinking")):
-            try:
-                answer = ai_reply(
-                    client,
-                    st.session_state.history
-                )
-
-                st.session_state.history.append({
-                    "role": "assistant",
-                    "content": answer
-                })
-
-                st.session_state.last_reply = answer
-                st.session_state.audio_reply = None
-
-            except Exception as error:
-                st.error(f"AI error: {error}")
-
-        st.rerun()
+                        st.error(tr("duplicate_email"))
 
     st.divider()
-    st.subheader("🎙️ " + t("speak"))
-    st.caption(t("microphone_caption"))
+    st.subheader(tr("creator_access"))
+    creator_code = st.text_input(tr("creator_code"), type="password", key="creator_access_code")
+    if st.button(tr("enter_creator"), use_container_width=True):
+        try:
+            expected = st.secrets.get("CREATOR_ACCESS_CODE", "")
+            creator_name = st.secrets.get("CREATOR_NAME", "Careloop Creator")
+            creator_email = st.secrets.get("CREATOR_EMAIL", "creator@careloop.local")
+        except Exception:
+            expected = ""
+            creator_name = "Careloop Creator"
+            creator_email = "creator@careloop.local"
 
-    recording = st.audio_input(
-        t("record"),
-        sample_rate=16000
-    )
+        if not expected:
+            st.error(tr("creator_config_missing"))
+        elif hmac.compare_digest(creator_code, str(expected)):
+            st.session_state.user = {"name": creator_name, "email": creator_email}
+            st.session_state.is_creator = True
+            st.rerun()
+        else:
+            st.error(tr("wrong_creator_code"))
 
-    if recording is not None:
-        if st.button(t("transcribe")):
-            with st.spinner(t("listening")):
-                try:
-                    spoken_text = transcribe(client, recording)
 
-                    if spoken_text:
-                        st.session_state.history.append({
-                            "role": "user",
-                            "content": spoken_text
-                        })
+def dashboard():
+    user = st.session_state.user
+    st.markdown(f"""
+    <div class="hero">
+      <h1>{tr('hello')}, {user['name']} 👋</h1>
+      <p>{tr('welcome')}</p>
+    </div>
+    """, unsafe_allow_html=True)
+    a, b, c = st.columns(3)
+    with a:
+        st.markdown(f'<div class="mini-card"><h3>💬 {tr("companion")}</h3><p>{tr("dashboard_companion")}</p></div>', unsafe_allow_html=True)
+    with b:
+        st.markdown(f'<div class="mini-card"><h3>🧠 {tr("quiz")}</h3><p>{tr("dashboard_quiz")}</p></div>', unsafe_allow_html=True)
+    with c:
+        st.markdown(f'<div class="mini-card"><h3>📅 {tr("reminders")}</h3><p>{tr("dashboard_reminders")}</p></div>', unsafe_allow_html=True)
+    st.write("")
+    st.info(tr("choose_page"))
 
-                        answer = ai_reply(
-                            client,
-                            st.session_state.history
-                        )
 
-                        st.session_state.history.append({
-                            "role": "assistant",
-                            "content": answer
-                        })
+def companion_page(client):
+    st.markdown("## 💬 " + tr("companion"))
+    st.caption(tr("chat_caption"))
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
 
-                        st.session_state.last_reply = answer
-                        st.session_state.audio_reply = None
-                        st.rerun()
-                    else:
-                        st.warning(t("no_speech"))
+    for item in st.session_state.chat_history:
+        with st.chat_message(item["role"]):
+            st.markdown(item["content"])
 
-                except Exception as error:
-                    st.error(f"Voice input error: {error}")
+    with st.form("chat_form", clear_on_submit=True):
+        prompt = st.text_area(tr("message"), height=90, key="typed_prompt")
+        sent = st.form_submit_button(tr("send"), use_container_width=True)
 
-    if st.session_state.get("last_reply"):
-        st.divider()
-        st.subheader("🔊 " + t("hear"))
+    if sent and prompt.strip():
+        st.session_state.chat_history.append({"role": "user", "content": prompt.strip()})
+        with st.spinner(tr("thinking")):
+            try:
+                answer = ask_ai(
+                    client, st.session_state.chat_history,
+                    st.session_state.language, st.session_state.user["name"]
+                )
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                st.session_state.last_reply = answer
+            except Exception as exc:
+                st.error(f"{tr('ai_error')}: {exc}")
+        st.rerun()
 
-        if st.button(t("generate_voice")):
-            with st.spinner("Generating voice..."):
-                try:
-                    st.session_state.audio_reply = generate_voice(
-                        client,
-                        st.session_state.last_reply
+    st.markdown("---")
+    st.markdown("### 🎙️ " + tr("voice"))
+    st.caption(tr("voice_help"))
+    recording = st.audio_input(tr("record"), sample_rate=16000, key="careloop_mic")
+    if recording is not None and st.button(tr("transcribe_send"), key="send_voice"):
+        with st.spinner(tr("listening")):
+            try:
+                transcript = transcribe_audio(client, recording)
+                if not transcript:
+                    st.warning(tr("no_speech"))
+                else:
+                    st.session_state.chat_history.append({"role": "user", "content": transcript})
+                    answer = ask_ai(
+                        client, st.session_state.chat_history,
+                        st.session_state.language, st.session_state.user["name"]
                     )
-                except Exception as error:
-                    st.error(f"Voice output error: {error}")
+                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                    st.session_state.last_reply = answer
+                    st.session_state.voice_transcript = transcript
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"{tr('voice_error')}: {exc}")
 
-        if st.session_state.get("audio_reply"):
-            st.audio(
-                st.session_state.audio_reply,
-                format="audio/mp3"
-            )
+    if st.session_state.get("voice_transcript"):
+        st.info(f"{tr('recognized')}: {st.session_state.voice_transcript}")
 
-    if st.button(t("clear_chat")):
-        st.session_state.history = []
-        st.session_state.last_reply = ""
-        st.session_state.audio_reply = None
+    last_reply = st.session_state.get("last_reply")
+    if last_reply:
+        st.markdown("---")
+        st.markdown("### 🔊 " + tr("read_reply"))
+        if st.button(tr("generate_speech"), key="generate_speech"):
+            with st.spinner(tr("generating_voice")):
+                try:
+                    st.session_state.reply_audio = make_speech(client, last_reply)
+                except Exception as exc:
+                    st.error(f"{tr('speech_error')}: {exc}")
+        if st.session_state.get("reply_audio"):
+            st.audio(st.session_state.reply_audio, format="audio/wav")
+            st.caption(tr("audio_note"))
+
+    if st.button(tr("clear_chat"), key="clear_chat"):
+        for key in ["chat_history", "last_reply", "reply_audio", "voice_transcript"]:
+            st.session_state.pop(key, None)
         st.rerun()
 
 
-# ==================================================
-# QUIZ
-# ==================================================
+def generate_quiz_content_with_retry(client, prompt, max_attempts=4):
+    """Call Gemini for quiz JSON, retrying temporary overload/rate failures."""
+    delays = [2, 4, 8]
+    for attempt in range(max_attempts):
+        try:
+            return client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=950,
+                    response_mime_type="application/json",
+                ),
+            )
+        except Exception as exc:
+            message = str(exc).upper()
+            is_temporary = (
+                "503" in message
+                or "UNAVAILABLE" in message
+                or "429" in message
+                or "RESOURCE_EXHAUSTED" in message
+                or "500" in message
+                or "INTERNAL" in message
+            )
+            if not is_temporary or attempt >= max_attempts - 1:
+                raise
+            wait_seconds = delays[min(attempt, len(delays) - 1)]
+            time.sleep(wait_seconds)
+
+    raise RuntimeError("Gemini could not generate the quiz after several attempts.")
+
 
 def quiz_page(client):
-    st.title("🧠 " + t("quiz"))
-
-    topic = st.text_input(t("topic"))
-
-    difficulty = st.selectbox(
-        t("difficulty"),
-        [t("easy"), t("medium"), t("hard")]
-    )
-
-    if st.button(t("generate_quiz")):
+    st.markdown("## 🧠 " + tr("quiz"))
+    topic = st.text_input(tr("quiz_topic"), placeholder=tr("quiz_topic_hint"))
+    difficulty_labels = [tr("easy"), tr("medium"), tr("hard")]
+    difficulty = st.selectbox(tr("difficulty"), difficulty_labels)
+    if st.button(tr("generate_quiz")):
         if not topic.strip():
-            st.warning(t("enter_topic"))
+            st.warning(tr("enter_topic"))
         else:
-            language = selected_ai_language()
+            prompt = f"""Create exactly 5 useful multiple-choice questions.
+Topic: {topic}
+Difficulty: {difficulty}
+Language: {st.session_state.language}
 
-            prompt = f"""
-Create 5 multiple-choice questions about {topic}.
-Difficulty: {difficulty}.
-Language: {language}.
+Return ONLY a valid JSON array. Each item must contain:
+- "question": a concise question
+- "options": exactly 4 short, distinct answer strings
+- "answer": the zero-based integer index of the one correct option
+- "explanation": one short sentence explaining the answer
 
-Return only a JSON array.
-Each question must contain:
-question, options (4 choices), answer (0-3), explanation.
-"""
-
-            with st.spinner(t("thinking")):
+Avoid long introductions and unnecessary detail. Check that every answer index is correct.
+Do not use Markdown fences or text outside the JSON array."""
+            with st.spinner(tr("creating_quiz")):
                 try:
-                    response = client.responses.create(
-                        model=CHAT_MODEL,
-                        input=prompt
-                    )
-
-                    raw = response.output_text.strip()
-                    raw = raw.replace("```json", "").replace("```", "").strip()
-
-                    st.session_state.quiz = json.loads(raw)
+                    response = generate_quiz_content_with_retry(client, prompt)
+                    raw = (response.text or "").strip()
+                    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                    quiz_data = json.loads(raw)
+                    if not isinstance(quiz_data, list) or len(quiz_data) != 5:
+                        raise ValueError("The AI did not return exactly five questions.")
+                    for item in quiz_data:
+                        if (
+                            not isinstance(item, dict)
+                            or not isinstance(item.get("question"), str)
+                            or not isinstance(item.get("options"), list)
+                            or len(item["options"]) != 4
+                            or not isinstance(item.get("answer"), int)
+                            or item["answer"] not in range(4)
+                            or not isinstance(item.get("explanation"), str)
+                        ):
+                            raise ValueError("The quiz response had an invalid question format.")
+                    st.session_state.quiz = quiz_data
                     st.session_state.quiz_topic = topic
-
-                except Exception as error:
-                    st.error(f"Quiz error: {error}")
+                except Exception as exc:
+                    error_text = str(exc)
+                    if "503" in error_text or "UNAVAILABLE" in error_text.upper():
+                        st.error(
+                            "Gemini is temporarily busy. Careloop retried automatically, "
+                            "but the service is still unavailable. Please try again in a minute."
+                        )
+                    elif "429" in error_text or "RESOURCE_EXHAUSTED" in error_text.upper():
+                        st.error(
+                            "Gemini's request quota is temporarily exhausted. "
+                            "Please wait before generating another quiz."
+                        )
+                    else:
+                        st.error(f"{tr('quiz_error')}: {exc}")
 
     if st.session_state.get("quiz"):
-        st.subheader(st.session_state.quiz_topic)
-
+        st.markdown(f"### {st.session_state.get('quiz_topic', tr('quiz'))}")
         with st.form("quiz_answers"):
-            answers = []
-
+            chosen = []
             for i, question in enumerate(st.session_state.quiz):
-                st.write(
-                    f"**{i+1}. {question['question']}**"
-                )
-
-                answer = st.radio(
-                    t("choose_answer"),
-                    question["options"],
-                    index=None,
-                    key=f"answer_{i}"
-                )
-
-                answers.append(answer)
-
-            submitted = st.form_submit_button(t("check_answers"))
-
-        if submitted:
+                st.write(f"**{i + 1}. {question['question']}**")
+                chosen.append(st.radio(
+                    tr("choose_answer"), question["options"],
+                    key=f"quiz_{i}", index=None
+                ))
+            checked = st.form_submit_button(tr("check_answers"))
+        if checked:
             score = 0
-
-            for question, answer in zip(
-                st.session_state.quiz,
-                answers
-            ):
+            for question, answer in zip(st.session_state.quiz, chosen):
                 correct = question["options"][question["answer"]]
-
                 if answer == correct:
                     score += 1
-                    st.success(
-                        t("correct") + " " + question["explanation"]
-                    )
+                    st.success(f"{tr('correct')} — {question['explanation']}")
                 else:
-                    st.error(
-                        f"Correct answer: {correct}. "
-                        + question["explanation"]
-                    )
+                    st.error(f"{tr('correct_answer')}: {correct}. {question['explanation']}")
+            st.markdown(f"## {tr('score')}: {score} / {len(st.session_state.quiz)}")
 
-            st.subheader(
-                f"{t('score')}: {score}/{len(st.session_state.quiz)}"
-            )
-
-
-# ==================================================
-# REMINDERS
-# ==================================================
 
 def reminders_page():
-    st.title("📅 " + t("reminders"))
-
+    st.markdown("## 📅 " + tr("reminders"))
     with st.form("reminder_form", clear_on_submit=True):
-        title = st.text_input(t("reminder"))
-        due_date = st.date_input(t("date"), value=date.today())
-
-        submitted = st.form_submit_button(t("add_reminder"))
-
-    if submitted:
+        title = st.text_input(tr("reminder_title"))
+        reminder_date = st.date_input(tr("date"), value=date.today())
+        added = st.form_submit_button(tr("add_reminder"))
+    if added:
         if title.strip():
-            with connection() as conn:
+            with db() as conn:
                 conn.execute("""
-                    INSERT INTO reminders(email,title,due_date)
-                    VALUES(?,?,?)
+                    INSERT INTO reminders(email,title,reminder_date,created_at)
+                    VALUES(?,?,?,?)
                 """, (
-                    st.session_state.user["email"],
-                    title.strip(),
-                    due_date.isoformat()
+                    st.session_state.user["email"], title.strip(),
+                    reminder_date.isoformat(), datetime.now().isoformat()
                 ))
-
-            st.success(t("saved"))
+            st.success(tr("reminder_saved"))
         else:
-            st.warning(t("reminder"))
+            st.warning(tr("enter_reminder"))
 
-    with connection() as conn:
-        reminders = conn.execute("""
-            SELECT id,title,due_date
-            FROM reminders
-            WHERE email=?
-            ORDER BY due_date
-        """, (
-            st.session_state.user["email"],
-        )).fetchall()
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id,title,reminder_date FROM reminders
+            WHERE email=? ORDER BY reminder_date ASC
+        """, (st.session_state.user["email"],)).fetchall()
 
-    if not reminders:
-        st.info(t("no_reminders"))
+    if rows:
+        for reminder_id, title, due in rows:
+            col1, col2 = st.columns([5, 1])
+            col1.write(f"**{title}** · {due}")
+            if col2.button(tr("delete"), key=f"delete_{reminder_id}"):
+                with db() as conn:
+                    conn.execute(
+                        "DELETE FROM reminders WHERE id=? AND email=?",
+                        (reminder_id, st.session_state.user["email"])
+                    )
+                st.rerun()
+    else:
+        st.info(tr("no_reminders"))
 
-    for rid, title, due in reminders:
-        col1, col2 = st.columns([5, 1])
-
-        col1.write(f"**{title}** — {due}")
-
-        if col2.button(t("delete"), key=f"delete_{rid}"):
-            with connection() as conn:
-                conn.execute(
-                    "DELETE FROM reminders WHERE id=? AND email=?",
-                    (rid, st.session_state.user["email"])
-                )
-
-            st.rerun()
-
-
-# ==================================================
-# PROFILE
-# ==================================================
 
 def profile_page():
-    st.title("👤 " + t("profile"))
-
-    st.subheader(t("profile_info"))
-    st.write(t("name") + ":", st.session_state.user["name"])
-    st.write(t("email") + ":", st.session_state.user["email"])
-
-    st.info(
-        "Change your language using the language selector "
-        "in the sidebar."
+    st.markdown("## 👤 " + tr("profile"))
+    user = st.session_state.user
+    st.write(f"**{tr('profile_name')}:** {user['name']}")
+    st.write(f"**{tr('profile_email')}:** {user['email']}")
+    new_language = st.selectbox(
+        tr("language"),
+        LANGUAGES,
+        index=LANGUAGES.index(st.session_state.language),
+        key="profile_language",
+        format_func=lambda item: f"{LANGUAGE_NATIVE.get(item, item)} — {item}",
     )
+    if st.button(tr("save_profile")):
+        st.session_state.language = new_language
+        st.session_state.ui_translations = get_translation(
+            st.session_state.client, new_language
+        )
+        st.success(tr("language_updated"))
+        st.rerun()
 
 
-# ==================================================
-# MAIN APPLICATION
-# ==================================================
+def creator_users_page():
+    if not st.session_state.get("is_creator", False):
+        st.error(tr("creator_only"))
+        return
 
+    st.markdown("## 👥 " + tr("user_management"))
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        rows = conn.execute("""
+            SELECT name, email, created_at
+            FROM users
+            ORDER BY created_at DESC
+        """).fetchall()
+
+    st.metric(tr("total_users"), total)
+    st.subheader(tr("registered_users"))
+    if not rows:
+        st.info(tr("no_users"))
+        return
+
+    table = []
+    for name, email, created_at in rows:
+        if created_at:
+            try:
+                created = datetime.fromisoformat(created_at).strftime("%d %b %Y, %I:%M %p")
+            except ValueError:
+                created = created_at
+        else:
+            created = tr("not_available")
+        table.append({
+            tr("name"): name or tr("not_available"),
+            tr("email"): email,
+            tr("registration_date"): created,
+        })
+    st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 def main():
-    initialize_database()
+    init_db()
+    inject_css()
 
     if "language" not in st.session_state:
         st.session_state.language = "English"
-
     if "user" not in st.session_state:
-        st.session_state.user = {
-            "name": "Guest",
-            "email": "guest@careloop.local"
-        }
-
-    if "history" not in st.session_state:
-        st.session_state.history = []
-
-    if "last_reply" not in st.session_state:
-        st.session_state.last_reply = ""
-
-    if "audio_reply" not in st.session_state:
-        st.session_state.audio_reply = None
+        st.session_state.user = None
+    if "is_creator" not in st.session_state:
+        st.session_state.is_creator = False
 
     client = get_client()
+    st.session_state.client = client
 
-    if not client:
-        st.error(t("api_missing"))
+    # Language selector is available before login.
+    if not st.session_state.user:
+        language_choice = st.selectbox(
+            "🌐 " + UI_EN["language"],
+            LANGUAGES,
+            index=LANGUAGES.index(st.session_state.language),
+            key="prelogin_language",
+            format_func=lambda item: f"{LANGUAGE_NATIVE.get(item, item)} — {item}",
+        )
+        if language_choice != st.session_state.language:
+            st.session_state.language = language_choice
+            st.rerun()
+
+    st.session_state.ui_translations = get_translation(
+        client, st.session_state.language
+    )
+
+    if not st.session_state.user:
+        auth_screen(client)
         return
 
     with st.sidebar:
-        st.title("💜 Careloop")
-        st.write("Hello, Guest 👋")
-
-        language_options = list(LANGUAGES.keys())
-
-        # Convert the saved language into its display label.
-        current_language = st.session_state.language
-
-        current_label = next(
-            (
-                label
-                for label, language_name in LANGUAGES.items()
-                if language_name == current_language
-            ),
-            "English"
+        st.markdown("# 💜 Careloop")
+        st.caption(tr("app_tagline"))
+        st.write(f"{tr('hello')}, {st.session_state.user['name']}")
+        language_choice = st.selectbox(
+            tr("language"),
+            LANGUAGES,
+            index=LANGUAGES.index(st.session_state.language),
+            key="sidebar_language",
+            format_func=lambda item: f"{LANGUAGE_NATIVE.get(item, item)} — {item}",
         )
-
-        selected_label = st.selectbox(
-            t("language"),
-            language_options,
-            index=language_options.index(current_label),
-            key="main_language_selector"
-        )
-
-        # Store the canonical language name, not the display label.
-        if selected_label != current_label:
-            st.session_state.language = LANGUAGES[selected_label]
+        if language_choice != st.session_state.language:
+            st.session_state.language = language_choice
+            st.session_state.ui_translations = get_translation(client, language_choice)
             st.rerun()
 
-        st.divider()
+        pages = [
+            tr("dashboard"), tr("companion"), tr("quiz"),
+            tr("reminders"), tr("profile"),
+        ]
+        if st.session_state.get("is_creator", False):
+            pages.append(tr("user_management"))
+        page = st.radio("Menu", pages, label_visibility="collapsed")
 
-        page = st.radio(
-            t("menu"),
-            [
-                t("dashboard"),
-                t("companion"),
-                t("quiz"),
-                t("reminders"),
-                t("profile")
-            ]
-        )
+        if st.session_state.get("is_creator", False):
+            st.caption("🔐 " + tr("creator_badge"))
 
-    if page == t("dashboard"):
+        if st.button(tr("logout"), use_container_width=True):
+            for key in list(st.session_state.keys()):
+                if key not in ["language", "ui_translations"]:
+                    st.session_state.pop(key, None)
+            st.session_state.user = None
+            st.session_state.is_creator = False
+            st.rerun()
+
+    if not client:
+        st.error(tr("api_key_missing"))
+        return
+
+    if page == tr("dashboard"):
         dashboard()
-
-    elif page == t("companion"):
+    elif page == tr("companion"):
         companion_page(client)
-
-    elif page == t("quiz"):
+    elif page == tr("quiz"):
         quiz_page(client)
-
-    elif page == t("reminders"):
+    elif page == tr("reminders"):
         reminders_page()
-
-    elif page == t("profile"):
+    elif page == tr("profile"):
         profile_page()
+    elif page == tr("user_management") and st.session_state.get("is_creator", False):
+        creator_users_page()
 
 
 if __name__ == "__main__":
