@@ -1,2 +1,16 @@
+# Keep Streamlit secrets private, but allow public config.toml
 .streamlit/secrets.toml
-careloop.db
+
+# Firebase private credentials
+*firebase-adminsdk*.json
+
+# Local database and environment
+*.db
+venv/
+__pycache__/
+*.py[cod]
+
+# Local files and backups
+.DS_Store
+app_backup*.py
+app_before_*.py
