@@ -571,18 +571,20 @@ def get_client():
 
 
 def get_translation(client, language):
-    """Translate the UI in small Gemini requests, retry temporary failures, and cache success."""
+    """Load cached UI translations first; translate and cache only missing batches."""
     if language == "English":
         return UI_EN
 
     cache_key = f"ui_translations_{language}"
-    if cache_key in st.session_state:
-        cached_session = st.session_state[cache_key]
-        if isinstance(cached_session, dict) and all(k in cached_session for k in UI_EN):
-            return cached_session
-        st.session_state.pop(cache_key, None)
+    translated = {}
 
-    # Reuse only complete cached translations. Ignore old/incomplete cache rows.
+    # Start with any translations already cached in this Streamlit session.
+    session_cached = st.session_state.get(cache_key, {})
+    if isinstance(session_cached, dict):
+        translated.update({k: str(v) for k, v in session_cached.items() if k in UI_EN})
+
+    # Merge the persistent SQLite cache. Partial caches are useful after a temporary
+    # Gemini outage: the next attempt resumes only the missing strings.
     try:
         with db() as conn:
             row = conn.execute(
@@ -591,24 +593,24 @@ def get_translation(client, language):
             ).fetchone()
         if row:
             cached = json.loads(row[0])
-            if isinstance(cached, dict) and all(k in cached for k in UI_EN):
-                translated = {key: str(cached[key]) for key in UI_EN}
-                st.session_state[cache_key] = translated
-                return translated
+            if isinstance(cached, dict):
+                translated.update({k: str(v) for k, v in cached.items() if k in UI_EN})
     except Exception:
         pass
 
+    if all(k in translated for k in UI_EN):
+        st.session_state[cache_key] = translated
+        return translated
+
     if client is None:
-        st.error("Translation unavailable: GEMINI_API_KEY is not configured.")
+        st.warning("Translation unavailable: GEMINI_API_KEY is not configured. Showing English.")
         return UI_EN
 
-    translated = {}
-    items = list(UI_EN.items())
-    delays = [2, 4, 8, 12]
+    missing_items = [(k, v) for k, v in UI_EN.items() if k not in translated]
+    batches = [dict(missing_items[i:i + 12]) for i in range(0, len(missing_items), 12)]
+    progress = st.progress(0, text=f"Preparing {language}…")
 
-    # Ten short strings per request helps avoid oversized responses.
-    for start_index in range(0, len(items), 10):
-        batch = dict(items[start_index:start_index + 10])
+    for batch_number, batch in enumerate(batches, start=1):
         prompt = (
             f"Translate every value in this JSON object into {language}. "
             "Preserve every key exactly. Return only a valid JSON object, no Markdown. "
@@ -617,13 +619,17 @@ def get_translation(client, language):
             + json.dumps(batch, ensure_ascii=False)
         )
 
-        for attempt in range(4):
+        # Short bounded retries: avoid the old 2+4+8+12 second wait on every batch.
+        last_error = None
+        for attempt, wait_seconds in enumerate((0, 1, 2), start=1):
+            if wait_seconds:
+                time.sleep(wait_seconds)
             try:
                 response = client.models.generate_content(
                     model=CHAT_MODEL,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        max_output_tokens=1200,
+                        max_output_tokens=1600,
                         response_mime_type="application/json",
                     ),
                 )
@@ -635,37 +641,55 @@ def get_translation(client, language):
                 if not isinstance(data, dict) or not all(k in data for k in batch):
                     raise ValueError("Gemini returned incomplete translation JSON.")
                 translated.update({key: str(data[key]) for key in batch})
+                last_error = None
                 break
             except Exception as exc:
+                last_error = exc
                 message = str(exc).upper()
                 temporary = any(token in message for token in (
                     "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
                     "500", "INTERNAL", "TIMEOUT", "DEADLINE"
                 ))
-                if temporary and attempt < 3:
-                    time.sleep(delays[attempt])
-                    continue
-                st.error(
-                    f"Translation failed for {language} ({type(exc).__name__}): {exc}"
-                )
-                return UI_EN
+                if not temporary or attempt == 3:
+                    break
 
-    # Save only after all batches have completed successfully.
-    try:
-        with db() as conn:
-            conn.execute(
-                """INSERT INTO translation_cache(language, translations_json, updated_at)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(language) DO UPDATE SET
-                     translations_json=excluded.translations_json,
-                     updated_at=excluded.updated_at""",
-                (language, json.dumps(translated, ensure_ascii=False), datetime.now().isoformat()),
+        # Persist every successful batch immediately, so a later failure never
+        # throws away earlier work and the next language change can resume.
+        try:
+            with db() as conn:
+                conn.execute(
+                    """INSERT INTO translation_cache(language, translations_json, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(language) DO UPDATE SET
+                         translations_json=excluded.translations_json,
+                         updated_at=excluded.updated_at""",
+                    (language, json.dumps(translated, ensure_ascii=False), datetime.now().isoformat()),
+                )
+        except Exception:
+            pass
+
+        progress.progress(
+            min(batch_number / max(len(batches), 1), 1.0),
+            text=f"Preparing {language}: {batch_number}/{len(batches)} batches…",
+        )
+
+        if last_error is not None:
+            progress.empty()
+            st.session_state[cache_key] = translated
+            st.warning(
+                f"Gemini could not finish translating {language}: {type(last_error).__name__}: "
+                f"{last_error}. Successful batches were saved; try selecting this language again."
             )
-    except Exception as exc:
-        st.warning(f"Translation completed but could not be cached: {exc}")
+            return UI_EN
+
+    progress.empty()
+    if all(k in translated for k in UI_EN):
+        st.session_state[cache_key] = translated
+        return translated
 
     st.session_state[cache_key] = translated
-    return translated
+    st.warning(f"Some {language} translations are still missing. Showing English until they are complete.")
+    return UI_EN
 
 
 def tr(key):
@@ -785,9 +809,7 @@ def auth_screen(client):
         st.caption(tr("medical_notice"))
 
     with right:
-        # Registration is shown first and selected by default; login is second.
         tab_register, tab_login = st.tabs([tr("register"), tr("login")])
-
         with tab_register:
             name = st.text_input(tr("name"), key="register_name")
             email_new = st.text_input(tr("email"), key="register_email")
