@@ -37,6 +37,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "careloop.db")
 LOGO_PATH = os.path.join(BASE_DIR, "careloop_logo.jpeg")
 
+# Browser-side Firebase Cloud Messaging registration component.
 CARELOOP_NOTIFICATION_COMPONENT = components.declare_component(
     "careloop_notifications",
     path=os.path.join(BASE_DIR, "careloop_notifications"),
@@ -379,6 +380,7 @@ def delete_reminder_from_firestore(email, reminder_id):
 
 
 def save_fcm_token(email, token, user_agent=""):
+    """Store a browser FCM token server-side, associated with the signed-in user."""
     client = get_firestore_client()
     if client is None or not token:
         return False
@@ -400,31 +402,44 @@ def save_fcm_token(email, token, user_agent=""):
 
 
 def browser_notifications_panel():
+    """Render Chrome permission/token registration and save returned token in Firestore."""
     st.markdown("### 🔔 Browser notifications")
-    st.caption("Allow Chrome notifications for this device. Delivery while the browser is closed depends on Chrome and your operating-system notification settings.")
+    st.caption("Allow Chrome notifications for this device. Keep in mind that delivery while the browser is closed depends on Chrome and your operating-system notification settings.")
+
     firebase_cfg = st.secrets.get("firebase", {})
     if not hasattr(firebase_cfg, "get"):
         st.warning("Firebase web configuration is missing from Streamlit Secrets.")
         return
+
     required = ["apiKey", "authDomain", "projectId", "messagingSenderId", "appId", "vapidKey"]
     missing = [key for key in required if not firebase_cfg.get(key)]
     if missing:
         st.warning("Missing Firebase web settings: " + ", ".join(missing))
         return
+
     config = {key: str(firebase_cfg[key]) for key in required if key != "vapidKey"}
+    vapid_key = str(firebase_cfg["vapidKey"])
+
     token = CARELOOP_NOTIFICATION_COMPONENT(
         firebase_config=config,
-        vapid_key=str(firebase_cfg["vapidKey"]),
+        vapid_key=vapid_key,
         key="careloop_fcm_registration",
         default=None,
     )
+
     if isinstance(token, str) and token.startswith("fcm:"):
         raw_token = token[4:]
-        if raw_token and save_fcm_token(st.session_state.user["email"], raw_token):
-            st.success("Chrome notification registration saved to Firestore.")
-            st.caption("This device is registered. Next we'll test sending a push notification.")
-        elif raw_token:
-            st.error("Chrome granted notification access, but Careloop could not save the device token to Firestore.")
+        if raw_token:
+            saved = save_fcm_token(
+                st.session_state.user["email"],
+                raw_token,
+                st.session_state.get("careloop_browser_user_agent", ""),
+            )
+            if saved:
+                st.success("Chrome notification registration saved to Firestore.")
+                st.caption("This device is registered. Next we'll test sending a push notification.")
+            else:
+                st.error("Chrome granted notification access, but Careloop could not save the device token to Firestore.")
     elif token == "permission-denied":
         st.warning("Chrome notification permission was denied. Allow notifications for this site in Chrome site settings, then try again.")
     elif token == "unsupported":
@@ -451,7 +466,6 @@ def init_db():
             ("password_hash", "TEXT"),
             ("salt", "TEXT"),
             ("created_at", "TEXT"),
-            ("last_login", "TEXT"),
         ]:
             if column not in cols:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {column} {declaration}")
@@ -530,26 +544,19 @@ def create_user(name, email, password):
         conn.execute("""
             INSERT INTO users(email, name, password_hash, salt, created_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (email, name.strip(), hashed, salt,
-              datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()))
+        """, (email, name.strip(), hashed, salt, datetime.now().isoformat()))
 
 
 def authenticate(email, password):
-    normalized_email = email.strip().lower()
     with db() as conn:
         row = conn.execute("""
             SELECT email, name, password_hash, salt
             FROM users WHERE email = ?
-        """, (normalized_email,)).fetchone()
-        if not row or not row[2] or not row[3]:
-            return None
-        if hmac.compare_digest(hash_password(password, row[3]), row[2]):
-            login_time = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
-            conn.execute(
-                "UPDATE users SET last_login=? WHERE email=?",
-                (login_time, normalized_email),
-            )
-            return {"email": row[0], "name": row[1]}
+        """, (email.strip().lower(),)).fetchone()
+    if not row or not row[2] or not row[3]:
+        return None
+    if hmac.compare_digest(hash_password(password, row[3]), row[2]):
+        return {"email": row[0], "name": row[1]}
     return None
 
 
@@ -778,18 +785,8 @@ def auth_screen(client):
         st.caption(tr("medical_notice"))
 
     with right:
-        tab_login, tab_register = st.tabs([tr("login"), tr("register")])
-        with tab_login:
-            email = st.text_input(tr("email"), key="login_email")
-            password = st.text_input(tr("password"), type="password", key="login_password")
-            if st.button(tr("login"), use_container_width=True):
-                user = authenticate(email, password)
-                if user:
-                    st.session_state.user = user
-                    st.session_state.is_creator = False
-                    st.rerun()
-                else:
-                    st.error(tr("login_error"))
+        # Registration is shown first and selected by default; login is second.
+        tab_register, tab_login = st.tabs([tr("register"), tr("login")])
 
         with tab_register:
             name = st.text_input(tr("name"), key="register_name")
@@ -806,6 +803,18 @@ def auth_screen(client):
                         st.success(tr("register_success"))
                     except sqlite3.IntegrityError:
                         st.error(tr("duplicate_email"))
+
+        with tab_login:
+            email = st.text_input(tr("email"), key="login_email")
+            password = st.text_input(tr("password"), type="password", key="login_password")
+            if st.button(tr("login"), use_container_width=True):
+                user = authenticate(email, password)
+                if user:
+                    st.session_state.user = user
+                    st.session_state.is_creator = False
+                    st.rerun()
+                else:
+                    st.error(tr("login_error"))
 
     st.divider()
     st.subheader(tr("creator_access"))
@@ -1277,22 +1286,6 @@ def profile_page():
         st.rerun()
 
 
-def _format_ist_datetime(value):
-    if not value:
-        return tr("not_available")
-    try:
-        parsed = datetime.fromisoformat(value)
-        if parsed.tzinfo is None:
-            # Older timestamps created on Streamlit Cloud were timezone-naive
-            # and used the server's UTC clock. Interpret those as UTC, then
-            # convert them to IST for display.
-            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
-        parsed = parsed.astimezone(ZoneInfo("Asia/Kolkata"))
-        return parsed.strftime("%d %b %Y, %I:%M:%S %p")
-    except (ValueError, TypeError):
-        return str(value)
-
-
 def creator_users_page():
     if not st.session_state.get("is_creator", False):
         st.error(tr("creator_only"))
@@ -1302,12 +1295,9 @@ def creator_users_page():
     with db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         rows = conn.execute("""
-            SELECT name, email, created_at, last_login
+            SELECT name, email, created_at
             FROM users
-            ORDER BY
-                CASE WHEN last_login IS NULL OR last_login = '' THEN 1 ELSE 0 END,
-                last_login DESC,
-                created_at DESC
+            ORDER BY created_at DESC
         """).fetchall()
 
     st.metric(tr("total_users"), total)
@@ -1317,12 +1307,18 @@ def creator_users_page():
         return
 
     table = []
-    for name, email, created_at, last_login in rows:
+    for name, email, created_at in rows:
+        if created_at:
+            try:
+                created = datetime.fromisoformat(created_at).strftime("%d %b %Y, %I:%M %p")
+            except ValueError:
+                created = created_at
+        else:
+            created = tr("not_available")
         table.append({
             tr("name"): name or tr("not_available"),
             tr("email"): email,
-            "Registered (IST)": _format_ist_datetime(created_at),
-            "Last login (IST)": _format_ist_datetime(last_login),
+            tr("registration_date"): created,
         })
     st.dataframe(table, use_container_width=True, hide_index=True)
 
