@@ -1,3 +1,4 @@
+// CARELOOP_STATIC_TEST_2026
 /* Careloop FCM background notification service worker.
    The scheduler will send data-only FCM messages; this worker displays them. */
 self.addEventListener("push", (event) => {
