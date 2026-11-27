@@ -23,7 +23,7 @@ from google.genai import types
 # Firebase Admin is used only on the Streamlit server. The service-account
 # credential is read from Streamlit Secrets and is never sent to the browser.
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, messaging
 
 # ============================================================
 # CARELOOP — complete single-file Streamlit application
@@ -404,6 +404,141 @@ def save_fcm_token(email, token, user_agent=""):
     except Exception as exc:
         print(f"Careloop FCM token save failed: {type(exc).__name__}: {exc}")
         return False
+
+
+
+def emergency_contact_doc_id(owner_email):
+    return hashlib.sha256(owner_email.strip().lower().encode("utf-8")).hexdigest()
+
+
+def save_emergency_contact(owner_email, parent_email, parent_phone):
+    """Save the parent's contact details server-side in Firestore."""
+    client = get_firestore_client()
+    if client is None:
+        return False
+    try:
+        client.collection("emergency_contacts").document(
+            emergency_contact_doc_id(owner_email)
+        ).set({
+            "owner_email": owner_email.strip().lower(),
+            "parent_email": parent_email.strip().lower(),
+            "parent_phone": parent_phone.strip(),
+            "updated_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        }, merge=True)
+        return True
+    except Exception as exc:
+        print(f"Careloop emergency contact save failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def get_emergency_contact(owner_email):
+    client = get_firestore_client()
+    if client is None:
+        return None
+    try:
+        doc = client.collection("emergency_contacts").document(
+            emergency_contact_doc_id(owner_email)
+        ).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception as exc:
+        print(f"Careloop emergency contact read failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def send_parent_emergency_alert(owner_email):
+    """Send an FCM push to tokens registered by the configured parent account."""
+    contact = get_emergency_contact(owner_email)
+    if not contact or not contact.get("parent_email"):
+        return 0, "Parent contact is not configured. Open Profile and save it first."
+    client = get_firestore_client()
+    if client is None:
+        return 0, "Firebase Admin is not configured on the Careloop server."
+    parent_email = contact["parent_email"].strip().lower()
+    try:
+        docs = client.collection("notification_tokens").where(
+            "owner_email", "==", parent_email
+        ).where("enabled", "==", True).stream()
+        tokens = [d.to_dict().get("token") for d in docs if d.to_dict().get("token")]
+        if not tokens:
+            return 0, "No parent device is registered. The parent must log in to Careloop and enable Browser notifications on their own device."
+        sent = 0
+        for token in tokens:
+            try:
+                messaging.send(messaging.Message(
+                    notification=messaging.Notification(
+                        title="Careloop emergency check-in",
+                        body="Your family member needs you. Please contact them now.",
+                    ),
+                    data={"type": "careloop_emergency", "sender": owner_email[:100]},
+                    token=token,
+                ), app=firebase_admin.get_app("careloop-admin"))
+                sent += 1
+            except Exception as exc:
+                print(f"Careloop emergency push failed: {type(exc).__name__}: {exc}")
+        return sent, ("Push notification sent to the parent's registered device." if sent
+                      else "Firebase could not deliver the notification. Check server logs and parent device registration.")
+    except Exception as exc:
+        print(f"Careloop emergency send failed: {type(exc).__name__}: {exc}")
+        return 0, "Could not send the parent notification. Check Firebase configuration and server logs."
+
+
+@st.fragment(run_every="1s")
+def emergency_countdown_panel():
+    """One-second server-side countdown with a visible cancel control."""
+    started = st.session_state.get("careloop_emergency_started")
+    if not started:
+        return
+    now = time.time()
+    remaining = max(0, 10 - int(now - started))
+    if remaining > 0:
+        st.error(f"Emergency alert will be sent in **{remaining} seconds** unless you cancel.")
+        if st.button("I'm safe — cancel alert", key="cancel_careloop_emergency", type="secondary"):
+            st.session_state.pop("careloop_emergency_started", None)
+            st.session_state.pop("careloop_emergency_sent", None)
+            st.success("Emergency alert cancelled.")
+            st.rerun()
+        return
+
+    if not st.session_state.get("careloop_emergency_sent"):
+        st.session_state.careloop_emergency_sent = True
+        sent, message = send_parent_emergency_alert(st.session_state.user["email"])
+        st.session_state.careloop_emergency_result = (sent, message)
+        st.session_state.pop("careloop_emergency_started", None)
+        st.rerun()
+
+
+def emergency_help_panel():
+    st.markdown("### 🆘 Emergency check-in")
+    st.warning(
+        "Careloop is not an emergency service. If someone is in immediate danger, "
+        "call India's emergency number 112 directly. Do not wait for this countdown."
+    )
+    contact = get_emergency_contact(st.session_state.user["email"])
+    phone = (contact or {}).get("parent_phone", "")
+    if phone:
+        dial = "tel:" + re.sub(r"[^+0-9]", "", phone)
+        st.markdown(f"**Parent phone:** {phone}")
+        st.link_button("📞 Call Parent", dial, use_container_width=True)
+    else:
+        st.info("Add a parent phone number in Profile before using Call Parent.")
+
+    if st.session_state.get("careloop_emergency_started"):
+        emergency_countdown_panel()
+    else:
+        if st.button("🚨 Start 10-second emergency alert", key="start_careloop_emergency", use_container_width=True):
+            st.session_state.careloop_emergency_started = time.time()
+            st.session_state.pop("careloop_emergency_result", None)
+            st.rerun()
+        emergency_countdown_panel()
+
+    result = st.session_state.get("careloop_emergency_result")
+    if result:
+        sent, message = result
+        if sent:
+            st.success(message)
+        else:
+            st.error(message)
+        st.caption("If the push does not arrive, use Call Parent or contact emergency services directly.")
 
 
 def browser_notifications_panel():
@@ -883,6 +1018,8 @@ def dashboard():
         st.markdown(f'<div class="mini-card"><h3>📅 {tr("reminders")}</h3><p>{tr("dashboard_reminders")}</p></div>', unsafe_allow_html=True)
     st.write("")
     st.info(tr("choose_page"))
+    st.divider()
+    emergency_help_panel()
 
 
 def companion_page(client):
@@ -1293,69 +1430,12 @@ def reminders_page():
 
 
 
-def _careloop_commons_photos(query, limit=6):
-    """Find freely licensed or public-domain images in Wikimedia Commons."""
-    params = urllib.parse.urlencode({
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": query + " filetype:bitmap",
-        "gsrnamespace": 6,
-        "gsrlimit": limit,
-        "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
-        "iiurlwidth": 720,
-        "format": "json",
-        "origin": "*",
-    })
-    request = urllib.request.Request(
-        "https://commons.wikimedia.org/w/api.php?" + params,
-        headers={"User-Agent": "CareloopLocationFinder/1.2 (Wikimedia Commons image search)"},
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    pages = payload.get("query", {}).get("pages", {})
-    photos = []
-    for page in pages.values():
-        info_list = page.get("imageinfo", [])
-        if not info_list:
-            continue
-        info = info_list[0]
-        meta = info.get("extmetadata", {})
-        photos.append({
-            "title": page.get("title", "Wikimedia Commons image"),
-            "url": info.get("thumburl") or info.get("url"),
-            "source_url": info.get("descriptionurl", "https://commons.wikimedia.org/"),
-            "license": meta.get("LicenseShortName", {}).get("value", "See source page"),
-            "artist": meta.get("Artist", {}).get("value", "Author not listed"),
-        })
-    return photos
-
-
-def _careloop_show_commons_photos(query):
-    st.markdown("### 📷 Available photographs")
-    st.caption("Searching Wikimedia Commons. These are real Commons images, but they may show the area or a similar building—not necessarily this exact apartment.")
-    try:
-        photos = _careloop_commons_photos(query)
-        if not photos:
-            st.info("No matching Wikimedia Commons photographs were found. This apartment may not have publicly available photos.")
-            return
-        cols = st.columns(2)
-        for index, photo in enumerate(photos):
-            with cols[index % 2]:
-                st.image(photo["url"], use_container_width=True)
-                st.caption(photo["title"])
-                st.caption("License: " + photo["license"] + " · " + photo["artist"])
-                st.markdown("[View image and attribution](" + photo["source_url"] + ")")
-    except Exception as exc:
-        st.info("Photo search is temporarily unavailable (" + type(exc).__name__ + "). The map search can still work.")
-
-
 def find_any_location_page():
-    """Search Photon and Nominatim, with external Google Maps and manual-pin fallbacks."""
+    """Search a public place/address with OpenStreetMap Nominatim and show a map."""
     st.markdown("## 📍 Find Any Location")
     st.caption(
-        "Search for an apartment, house, school, shop, hospital, or address. "
-        "Careloop checks two free OpenStreetMap-based search services. Results depend on their map data."
+        "Search for a house, apartment, school, shop, hospital, or an address. "
+        "Results depend on OpenStreetMap data; private or unlisted homes may not appear."
     )
 
     with st.form("careloop_location_search"):
@@ -1371,41 +1451,20 @@ def find_any_location_page():
             st.warning("Enter at least 3 characters.")
             st.session_state.pop("location_results", None)
         else:
-            combined = []
-            source_errors = []
-
-            # First try Photon. It is a separate free geocoder based on OSM data.
-            photon_params = urllib.parse.urlencode({"q": cleaned, "limit": 5})
-            photon_request = urllib.request.Request(
-                "https://photon.komoot.io/api/?" + photon_params,
-                headers={"User-Agent": "CareloopLocationFinder/1.1", "Accept": "application/json"},
-            )
-            try:
-                with urllib.request.urlopen(photon_request, timeout=15) as response:
-                    photon_data = json.loads(response.read().decode("utf-8"))
-                for feature in photon_data.get("features", []):
-                    coords = feature.get("geometry", {}).get("coordinates", [])
-                    props = feature.get("properties", {})
-                    if len(coords) < 2:
-                        continue
-                    parts = [props.get(k) for k in ("name", "street", "housenumber", "district", "city", "state", "country", "postcode")]
-                    label = ", ".join(str(part) for part in parts if part)
-                    if label:
-                        combined.append({
-                            "lat": str(coords[1]), "lon": str(coords[0]),
-                            "display_name": label, "source": "Photon",
-                        })
-            except Exception as exc:
-                source_errors.append("Photon: " + type(exc).__name__)
-
-            # Also query Nominatim, respecting its public one-request-per-second policy
-            # within this Streamlit process.
-            nom_params = urllib.parse.urlencode({
-                "q": cleaned, "format": "jsonv2", "limit": 5, "addressdetails": 1,
+            # Serialize requests across this Streamlit process to keep the
+            # public Nominatim service below its one-request-per-second limit.
+            params = urllib.parse.urlencode({
+                "q": cleaned,
+                "format": "jsonv2",
+                "limit": 5,
+                "addressdetails": 1,
             })
-            nom_request = urllib.request.Request(
-                "https://nominatim.openstreetmap.org/search?" + nom_params,
-                headers={"User-Agent": "CareloopLocationFinder/1.1 (Streamlit app)", "Accept": "application/json"},
+            request = urllib.request.Request(
+                "https://nominatim.openstreetmap.org/search?" + params,
+                headers={
+                    "User-Agent": "CareloopLocationFinder/1.0 (Streamlit app)"
+                    ,"Accept": "application/json"
+                },
             )
             try:
                 global _NOMINATIM_LAST_REQUEST
@@ -1413,40 +1472,26 @@ def find_any_location_page():
                     wait = 1.1 - (time.time() - _NOMINATIM_LAST_REQUEST)
                     if wait > 0:
                         time.sleep(wait)
-                    with urllib.request.urlopen(nom_request, timeout=15) as response:
-                        nom_data = json.loads(response.read().decode("utf-8"))
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        results = json.loads(response.read().decode("utf-8"))
                     _NOMINATIM_LAST_REQUEST = time.time()
-                for item in nom_data:
-                    item["source"] = "Nominatim"
-                    combined.append(item)
+                st.session_state.location_results = results
+                st.session_state.location_query = cleaned
             except Exception as exc:
-                source_errors.append("Nominatim: " + type(exc).__name__)
-
-            # Deduplicate near-identical coordinates returned by both providers.
-            unique = []
-            seen = set()
-            for item in combined:
-                try:
-                    key = (round(float(item["lat"]), 5), round(float(item["lon"]), 5))
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(item)
-            st.session_state.location_results = unique
-            st.session_state.location_query = cleaned
-            st.session_state.location_source_errors = source_errors
+                st.session_state.location_results = []
+                st.error(
+                    "The free map search service is temporarily unavailable. "
+                    "Please try again later."
+                )
+                # Keep technical detail in server logs, not in the public UI.
+                print(f"Careloop Nominatim search failed: {type(exc).__name__}: {exc}")
 
     results = st.session_state.get("location_results")
     if results is None:
         st.info("Enter a location above and press Search location.")
         return
     if not results:
-        st.warning("Neither Photon nor Nominatim found a matching place. The apartment may not be listed in their map data.")
-        google_query = urllib.parse.quote_plus(st.session_state.get("location_query", ""))
-        st.markdown(f"[Search this exact name in Google Maps](https://www.google.com/maps/search/?api=1&query={google_query})")
-        st.caption("Google Maps opens separately; Careloop does not use the Google Maps API or charge an API fee for this link.")
-        _careloop_show_commons_photos(st.session_state.get("location_query", ""))
+        st.warning("No matching location was found in OpenStreetMap. The apartment may not be listed by name.")
         st.markdown("### 📍 Find it using map coordinates")
         st.write(
             "You can still show the exact place. Open Google Maps on your phone, "
@@ -1473,7 +1518,7 @@ def find_any_location_page():
         if pin:
             lat, lon = pin["lat"], pin["lon"]
             st.markdown("### 📌 Selected map pin")
-            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Manually selected pin")
+            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
             manual_map_data = json.dumps({"lat": lat, "lon": lon}).replace("</", "<\\/")
             manual_map_html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1491,7 +1536,7 @@ def find_any_location_page():
         return
 
     choices = [
-        f"{item.get('display_name', 'Unknown location')} — {item.get('source', 'Map search')}"
+        f"{item.get('display_name', 'Unknown location')}"
         for item in results
     ]
     selected_index = st.selectbox(
@@ -1507,7 +1552,7 @@ def find_any_location_page():
 
     st.markdown("### 📌 Location details")
     st.write(address)
-    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Manually selected pin")
+    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
 
     # Leaflet + OpenStreetMap provides a real interactive map without a paid key.
     map_data = json.dumps({"lat": lat, "lon": lon, "label": address}).replace("</", "<\\/")
@@ -1544,8 +1589,6 @@ def find_any_location_page():
     )
     st.markdown(f"[Open map in OpenStreetMap]({osm_url})")
     st.markdown(f"[Get directions]({directions_url})")
-    google_pin_url = f"https://www.google.com/maps/search/?api=1&query={lat}%2C{lon}"
-    st.markdown(f"[View these coordinates in Google Maps]({google_pin_url})")
     st.caption(
         "Map and search data © OpenStreetMap contributors. "
         "This free version does not guarantee photos, exact building entrances, "
@@ -1572,6 +1615,27 @@ def profile_page():
         )
         st.success(tr("language_updated"))
         st.rerun()
+
+    st.divider()
+    st.subheader("🆘 Parent emergency contact")
+    st.caption("Enter a parent/guardian's details with their permission. Their email must belong to a Careloop account, and they must enable browser notifications on their own device.")
+    existing_contact = get_emergency_contact(user["email"]) or {}
+    with st.form("careloop_parent_contact_form"):
+        parent_email = st.text_input("Parent's Careloop email", value=existing_contact.get("parent_email", ""))
+        parent_phone = st.text_input("Parent's phone number", value=existing_contact.get("parent_phone", ""), help="Include country code, e.g. +91...")
+        save_parent = st.form_submit_button("Save parent contact", use_container_width=True)
+    if save_parent:
+        cleaned_phone = re.sub(r"[\s().-]", "", parent_phone)
+        if not parent_email.strip() or "@" not in parent_email:
+            st.error("Enter a valid parent email address.")
+        elif not re.fullmatch(r"\+?[0-9]{8,15}", cleaned_phone):
+            st.error("Enter a valid phone number with country code (8–15 digits).")
+        elif parent_email.strip().lower() == user["email"].strip().lower():
+            st.error("Enter the parent's own Careloop email, not your email.")
+        elif save_emergency_contact(user["email"], parent_email, cleaned_phone):
+            st.success("Parent contact saved securely in Firestore.")
+        else:
+            st.error("Could not save. Check Firebase Admin service-account configuration.")
 
 
 def creator_users_page():
