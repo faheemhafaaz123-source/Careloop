@@ -160,6 +160,7 @@ LANGUAGES = [
     'Haitian Creole',
     'Javanese',
     'Sundanese',
+    'Canada',
 ]
 # Stable translation keys. Keep values in English; translation is generated
 # once per language and stored in the translation_cache table.
