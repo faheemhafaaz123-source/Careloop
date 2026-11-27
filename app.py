@@ -1294,11 +1294,11 @@ def reminders_page():
 
 
 def find_any_location_page():
-    """Search a public place/address with OpenStreetMap Nominatim and show a map."""
+    """Search Photon and Nominatim, with external Google Maps and manual-pin fallbacks."""
     st.markdown("## 📍 Find Any Location")
     st.caption(
-        "Search for a house, apartment, school, shop, hospital, or an address. "
-        "Results depend on OpenStreetMap data; private or unlisted homes may not appear."
+        "Search for an apartment, house, school, shop, hospital, or address. "
+        "Careloop checks two free OpenStreetMap-based search services. Results depend on their map data."
     )
 
     with st.form("careloop_location_search"):
@@ -1314,20 +1314,41 @@ def find_any_location_page():
             st.warning("Enter at least 3 characters.")
             st.session_state.pop("location_results", None)
         else:
-            # Serialize requests across this Streamlit process to keep the
-            # public Nominatim service below its one-request-per-second limit.
-            params = urllib.parse.urlencode({
-                "q": cleaned,
-                "format": "jsonv2",
-                "limit": 5,
-                "addressdetails": 1,
+            combined = []
+            source_errors = []
+
+            # First try Photon. It is a separate free geocoder based on OSM data.
+            photon_params = urllib.parse.urlencode({"q": cleaned, "limit": 5})
+            photon_request = urllib.request.Request(
+                "https://photon.komoot.io/api/?" + photon_params,
+                headers={"User-Agent": "CareloopLocationFinder/1.1", "Accept": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(photon_request, timeout=15) as response:
+                    photon_data = json.loads(response.read().decode("utf-8"))
+                for feature in photon_data.get("features", []):
+                    coords = feature.get("geometry", {}).get("coordinates", [])
+                    props = feature.get("properties", {})
+                    if len(coords) < 2:
+                        continue
+                    parts = [props.get(k) for k in ("name", "street", "housenumber", "district", "city", "state", "country", "postcode")]
+                    label = ", ".join(str(part) for part in parts if part)
+                    if label:
+                        combined.append({
+                            "lat": str(coords[1]), "lon": str(coords[0]),
+                            "display_name": label, "source": "Photon",
+                        })
+            except Exception as exc:
+                source_errors.append("Photon: " + type(exc).__name__)
+
+            # Also query Nominatim, respecting its public one-request-per-second policy
+            # within this Streamlit process.
+            nom_params = urllib.parse.urlencode({
+                "q": cleaned, "format": "jsonv2", "limit": 5, "addressdetails": 1,
             })
-            request = urllib.request.Request(
-                "https://nominatim.openstreetmap.org/search?" + params,
-                headers={
-                    "User-Agent": "CareloopLocationFinder/1.0 (Streamlit app)"
-                    ,"Accept": "application/json"
-                },
+            nom_request = urllib.request.Request(
+                "https://nominatim.openstreetmap.org/search?" + nom_params,
+                headers={"User-Agent": "CareloopLocationFinder/1.1 (Streamlit app)", "Accept": "application/json"},
             )
             try:
                 global _NOMINATIM_LAST_REQUEST
@@ -1335,26 +1356,39 @@ def find_any_location_page():
                     wait = 1.1 - (time.time() - _NOMINATIM_LAST_REQUEST)
                     if wait > 0:
                         time.sleep(wait)
-                    with urllib.request.urlopen(request, timeout=15) as response:
-                        results = json.loads(response.read().decode("utf-8"))
+                    with urllib.request.urlopen(nom_request, timeout=15) as response:
+                        nom_data = json.loads(response.read().decode("utf-8"))
                     _NOMINATIM_LAST_REQUEST = time.time()
-                st.session_state.location_results = results
-                st.session_state.location_query = cleaned
+                for item in nom_data:
+                    item["source"] = "Nominatim"
+                    combined.append(item)
             except Exception as exc:
-                st.session_state.location_results = []
-                st.error(
-                    "The free map search service is temporarily unavailable. "
-                    "Please try again later."
-                )
-                # Keep technical detail in server logs, not in the public UI.
-                print(f"Careloop Nominatim search failed: {type(exc).__name__}: {exc}")
+                source_errors.append("Nominatim: " + type(exc).__name__)
+
+            # Deduplicate near-identical coordinates returned by both providers.
+            unique = []
+            seen = set()
+            for item in combined:
+                try:
+                    key = (round(float(item["lat"]), 5), round(float(item["lon"]), 5))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(item)
+            st.session_state.location_results = unique
+            st.session_state.location_query = cleaned
+            st.session_state.location_source_errors = source_errors
 
     results = st.session_state.get("location_results")
     if results is None:
         st.info("Enter a location above and press Search location.")
         return
     if not results:
-        st.warning("No matching location was found in OpenStreetMap. The apartment may not be listed by name.")
+        st.warning("Neither Photon nor Nominatim found a matching place. The apartment may not be listed in their map data.")
+        google_query = urllib.parse.quote_plus(st.session_state.get("location_query", ""))
+        st.markdown(f"[Search this exact name in Google Maps](https://www.google.com/maps/search/?api=1&query={google_query})")
+        st.caption("Google Maps opens separately; Careloop does not use the Google Maps API or charge an API fee for this link.")
         st.markdown("### 📍 Find it using map coordinates")
         st.write(
             "You can still show the exact place. Open Google Maps on your phone, "
@@ -1381,7 +1415,7 @@ def find_any_location_page():
         if pin:
             lat, lon = pin["lat"], pin["lon"]
             st.markdown("### 📌 Selected map pin")
-            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
+            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Found by {selected.get('source', 'map search')}")
             manual_map_data = json.dumps({"lat": lat, "lon": lon}).replace("</", "<\\/")
             manual_map_html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1399,7 +1433,7 @@ def find_any_location_page():
         return
 
     choices = [
-        f"{item.get('display_name', 'Unknown location')}"
+        f"{item.get('display_name', 'Unknown location')} — {item.get('source', 'Map search')}"
         for item in results
     ]
     selected_index = st.selectbox(
@@ -1415,7 +1449,7 @@ def find_any_location_page():
 
     st.markdown("### 📌 Location details")
     st.write(address)
-    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
+    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Found by {selected.get('source', 'map search')}")
 
     # Leaflet + OpenStreetMap provides a real interactive map without a paid key.
     map_data = json.dumps({"lat": lat, "lon": lon, "label": address}).replace("</", "<\\/")
@@ -1452,6 +1486,8 @@ def find_any_location_page():
     )
     st.markdown(f"[Open map in OpenStreetMap]({osm_url})")
     st.markdown(f"[Get directions]({directions_url})")
+    google_pin_url = f"https://www.google.com/maps/search/?api=1&query={lat}%2C{lon}"
+    st.markdown(f"[View these coordinates in Google Maps]({google_pin_url})")
     st.caption(
         "Map and search data © OpenStreetMap contributors. "
         "This free version does not guarantee photos, exact building entrances, "
