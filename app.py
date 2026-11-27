@@ -11,6 +11,9 @@ from zoneinfo import ZoneInfo
 from io import BytesIO
 import wave
 import time
+import threading
+import urllib.parse
+import urllib.request
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -34,6 +37,8 @@ st.set_page_config(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_NOMINATIM_LOCK = threading.Lock()
+_NOMINATIM_LAST_REQUEST = 0.0
 DB_PATH = os.path.join(BASE_DIR, "careloop.db")
 LOGO_PATH = os.path.join(BASE_DIR, "careloop_logo.jpeg")
 
@@ -1287,6 +1292,132 @@ def reminders_page():
     st.caption("This version checks every 5 seconds while this page is active. It does not yet send alerts when the website is closed or the phone is locked.")
 
 
+
+def find_any_location_page():
+    """Search a public place/address with OpenStreetMap Nominatim and show a map."""
+    st.markdown("## 📍 Find Any Location")
+    st.caption(
+        "Search for a house, apartment, school, shop, hospital, or an address. "
+        "Results depend on OpenStreetMap data; private or unlisted homes may not appear."
+    )
+
+    with st.form("careloop_location_search"):
+        query = st.text_input(
+            "What location are you looking for?",
+            placeholder="e.g. apartment name, house address, school, Bengaluru",
+        )
+        submitted = st.form_submit_button("Search location", use_container_width=True)
+
+    if submitted:
+        cleaned = query.strip()
+        if len(cleaned) < 3:
+            st.warning("Enter at least 3 characters.")
+            st.session_state.pop("location_results", None)
+        else:
+            # Serialize requests across this Streamlit process to keep the
+            # public Nominatim service below its one-request-per-second limit.
+            params = urllib.parse.urlencode({
+                "q": cleaned,
+                "format": "jsonv2",
+                "limit": 5,
+                "addressdetails": 1,
+            })
+            request = urllib.request.Request(
+                "https://nominatim.openstreetmap.org/search?" + params,
+                headers={
+                    "User-Agent": "CareloopLocationFinder/1.0 (Streamlit app)"
+                    ,"Accept": "application/json"
+                },
+            )
+            try:
+                global _NOMINATIM_LAST_REQUEST
+                with _NOMINATIM_LOCK:
+                    wait = 1.1 - (time.time() - _NOMINATIM_LAST_REQUEST)
+                    if wait > 0:
+                        time.sleep(wait)
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        results = json.loads(response.read().decode("utf-8"))
+                    _NOMINATIM_LAST_REQUEST = time.time()
+                st.session_state.location_results = results
+                st.session_state.location_query = cleaned
+            except Exception as exc:
+                st.session_state.location_results = []
+                st.error(
+                    "The free map search service is temporarily unavailable. "
+                    "Please try again later."
+                )
+                # Keep technical detail in server logs, not in the public UI.
+                print(f"Careloop Nominatim search failed: {type(exc).__name__}: {exc}")
+
+    results = st.session_state.get("location_results")
+    if results is None:
+        st.info("Enter a location above and press Search location.")
+        return
+    if not results:
+        st.warning("No matching location was found. Try adding the area, city, or PIN code.")
+        return
+
+    choices = [
+        f"{item.get('display_name', 'Unknown location')}"
+        for item in results
+    ]
+    selected_index = st.selectbox(
+        "Choose the correct match",
+        range(len(choices)),
+        format_func=lambda index: choices[index],
+        key="careloop_location_match",
+    )
+    selected = results[selected_index]
+    lat = float(selected["lat"])
+    lon = float(selected["lon"])
+    address = selected.get("display_name", "Address not available")
+
+    st.markdown("### 📌 Location details")
+    st.write(address)
+    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
+
+    # Leaflet + OpenStreetMap provides a real interactive map without a paid key.
+    map_data = json.dumps({"lat": lat, "lon": lon, "label": address}).replace("</", "<\\/")
+    map_html = """
+    <!doctype html>
+    <html><head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+      <style>html,body,#map{height:100%;margin:0} .leaflet-container{font:14px sans-serif}</style>
+    </head><body><div id="map"></div>
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+      <script>
+        const place = __PLACE__;
+        const map = L.map('map').setView([place.lat, place.lon], 16);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+        L.marker([place.lat, place.lon]).addTo(map).bindPopup(
+          place.label.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
+        ).openPopup();
+      </script>
+    </body></html>
+    """.replace("__PLACE__", map_data)
+    components.html(map_html, height=430, scrolling=False)
+
+    osm_url = (
+        "https://www.openstreetmap.org/?mlat=" + str(lat)
+        + "&mlon=" + str(lon) + "#map=18/" + str(lat) + "/" + str(lon)
+    )
+    directions_url = (
+        "https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route="
+        + str(lat) + "%2C" + str(lon)
+    )
+    st.markdown(f"[Open map in OpenStreetMap]({osm_url})")
+    st.markdown(f"[Get directions]({directions_url})")
+    st.caption(
+        "Map and search data © OpenStreetMap contributors. "
+        "This free version does not guarantee photos, exact building entrances, "
+        "or results for every private house."
+    )
+
+
 def profile_page():
     st.markdown("## 👤 " + tr("profile"))
     user = st.session_state.user
@@ -1398,7 +1529,7 @@ def main():
 
         pages = [
             tr("dashboard"), tr("companion"), tr("quiz"),
-            tr("reminders"), tr("profile"),
+            tr("reminders"), tr("profile"), "Find Any Location",
         ]
         if st.session_state.get("is_creator", False):
             pages.append(tr("user_management"))
@@ -1414,6 +1545,10 @@ def main():
             st.session_state.user = None
             st.session_state.is_creator = False
             st.rerun()
+
+    if page == "Find Any Location":
+        find_any_location_page()
+        return
 
     if not client:
         st.error(tr("api_key_missing"))
