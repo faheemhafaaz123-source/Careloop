@@ -1293,6 +1293,63 @@ def reminders_page():
 
 
 
+def _careloop_commons_photos(query, limit=6):
+    """Find freely licensed or public-domain images in Wikimedia Commons."""
+    params = urllib.parse.urlencode({
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query + " filetype:bitmap",
+        "gsrnamespace": 6,
+        "gsrlimit": limit,
+        "prop": "imageinfo",
+        "iiprop": "url|extmetadata",
+        "iiurlwidth": 720,
+        "format": "json",
+        "origin": "*",
+    })
+    request = urllib.request.Request(
+        "https://commons.wikimedia.org/w/api.php?" + params,
+        headers={"User-Agent": "CareloopLocationFinder/1.2 (Wikimedia Commons image search)"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    pages = payload.get("query", {}).get("pages", {})
+    photos = []
+    for page in pages.values():
+        info_list = page.get("imageinfo", [])
+        if not info_list:
+            continue
+        info = info_list[0]
+        meta = info.get("extmetadata", {})
+        photos.append({
+            "title": page.get("title", "Wikimedia Commons image"),
+            "url": info.get("thumburl") or info.get("url"),
+            "source_url": info.get("descriptionurl", "https://commons.wikimedia.org/"),
+            "license": meta.get("LicenseShortName", {}).get("value", "See source page"),
+            "artist": meta.get("Artist", {}).get("value", "Author not listed"),
+        })
+    return photos
+
+
+def _careloop_show_commons_photos(query):
+    st.markdown("### 📷 Available photographs")
+    st.caption("Searching Wikimedia Commons. These are real Commons images, but they may show the area or a similar building—not necessarily this exact apartment.")
+    try:
+        photos = _careloop_commons_photos(query)
+        if not photos:
+            st.info("No matching Wikimedia Commons photographs were found. This apartment may not have publicly available photos.")
+            return
+        cols = st.columns(2)
+        for index, photo in enumerate(photos):
+            with cols[index % 2]:
+                st.image(photo["url"], use_container_width=True)
+                st.caption(photo["title"])
+                st.caption("License: " + photo["license"] + " · " + photo["artist"])
+                st.markdown("[View image and attribution](" + photo["source_url"] + ")")
+    except Exception as exc:
+        st.info("Photo search is temporarily unavailable (" + type(exc).__name__ + "). The map search can still work.")
+
+
 def find_any_location_page():
     """Search Photon and Nominatim, with external Google Maps and manual-pin fallbacks."""
     st.markdown("## 📍 Find Any Location")
@@ -1389,6 +1446,7 @@ def find_any_location_page():
         google_query = urllib.parse.quote_plus(st.session_state.get("location_query", ""))
         st.markdown(f"[Search this exact name in Google Maps](https://www.google.com/maps/search/?api=1&query={google_query})")
         st.caption("Google Maps opens separately; Careloop does not use the Google Maps API or charge an API fee for this link.")
+        _careloop_show_commons_photos(st.session_state.get("location_query", ""))
         st.markdown("### 📍 Find it using map coordinates")
         st.write(
             "You can still show the exact place. Open Google Maps on your phone, "
@@ -1415,7 +1473,7 @@ def find_any_location_page():
         if pin:
             lat, lon = pin["lat"], pin["lon"]
             st.markdown("### 📌 Selected map pin")
-            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Found by {selected.get('source', 'map search')}")
+            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Manually selected pin")
             manual_map_data = json.dumps({"lat": lat, "lon": lon}).replace("</", "<\\/")
             manual_map_html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1449,7 +1507,7 @@ def find_any_location_page():
 
     st.markdown("### 📌 Location details")
     st.write(address)
-    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Found by {selected.get('source', 'map search')}")
+    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f} · Manually selected pin")
 
     # Leaflet + OpenStreetMap provides a real interactive map without a paid key.
     map_data = json.dumps({"lat": lat, "lon": lon, "label": address}).replace("</", "<\\/")
