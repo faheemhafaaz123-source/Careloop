@@ -11,12 +11,8 @@ from zoneinfo import ZoneInfo
 from io import BytesIO
 import wave
 import time
-import threading
-import urllib.parse
-import urllib.request
 
 import streamlit as st
-import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 
@@ -37,8 +33,6 @@ st.set_page_config(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_NOMINATIM_LOCK = threading.Lock()
-_NOMINATIM_LAST_REQUEST = 0.0
 DB_PATH = os.path.join(BASE_DIR, "careloop.db")
 LOGO_PATH = os.path.join(BASE_DIR, "careloop_logo.jpeg")
 
@@ -1378,171 +1372,6 @@ def reminders_page():
 
 
 
-def find_any_location_page():
-    """Search a public place/address with OpenStreetMap Nominatim and show a map."""
-    st.markdown("## 📍 Find Any Location")
-    st.caption(
-        "Search for a house, apartment, school, shop, hospital, or an address. "
-        "Results depend on OpenStreetMap data; private or unlisted homes may not appear."
-    )
-
-    with st.form("careloop_location_search"):
-        query = st.text_input(
-            "What location are you looking for?",
-            placeholder="e.g. apartment name, house address, school, Bengaluru",
-        )
-        submitted = st.form_submit_button("Search location", use_container_width=True)
-
-    if submitted:
-        cleaned = query.strip()
-        if len(cleaned) < 3:
-            st.warning("Enter at least 3 characters.")
-            st.session_state.pop("location_results", None)
-        else:
-            # Serialize requests across this Streamlit process to keep the
-            # public Nominatim service below its one-request-per-second limit.
-            params = urllib.parse.urlencode({
-                "q": cleaned,
-                "format": "jsonv2",
-                "limit": 5,
-                "addressdetails": 1,
-            })
-            request = urllib.request.Request(
-                "https://nominatim.openstreetmap.org/search?" + params,
-                headers={
-                    "User-Agent": "CareloopLocationFinder/1.0 (Streamlit app)"
-                    ,"Accept": "application/json"
-                },
-            )
-            try:
-                global _NOMINATIM_LAST_REQUEST
-                with _NOMINATIM_LOCK:
-                    wait = 1.1 - (time.time() - _NOMINATIM_LAST_REQUEST)
-                    if wait > 0:
-                        time.sleep(wait)
-                    with urllib.request.urlopen(request, timeout=15) as response:
-                        results = json.loads(response.read().decode("utf-8"))
-                    _NOMINATIM_LAST_REQUEST = time.time()
-                st.session_state.location_results = results
-                st.session_state.location_query = cleaned
-            except Exception as exc:
-                st.session_state.location_results = []
-                st.error(
-                    "The free map search service is temporarily unavailable. "
-                    "Please try again later."
-                )
-                # Keep technical detail in server logs, not in the public UI.
-                print(f"Careloop Nominatim search failed: {type(exc).__name__}: {exc}")
-
-    results = st.session_state.get("location_results")
-    if results is None:
-        st.info("Enter a location above and press Search location.")
-        return
-    if not results:
-        st.warning("No matching location was found in OpenStreetMap. The apartment may not be listed by name.")
-        st.markdown("### 📍 Find it using map coordinates")
-        st.write(
-            "You can still show the exact place. Open Google Maps on your phone, "
-            "search for LVS Heights, press and hold the building location to drop a pin, "
-            "then copy the latitude and longitude shown in the place details. "
-            "Enter those numbers below. Do not enter your flat number."
-        )
-        with st.form("careloop_manual_pin_form"):
-            col_lat, col_lon = st.columns(2)
-            with col_lat:
-                manual_lat = st.number_input(
-                    "Latitude", min_value=-90.0, max_value=90.0, value=13.000000,
-                    format="%.6f", key="careloop_manual_lat"
-                )
-            with col_lon:
-                manual_lon = st.number_input(
-                    "Longitude", min_value=-180.0, max_value=180.0, value=77.000000,
-                    format="%.6f", key="careloop_manual_lon"
-                )
-            pin_submitted = st.form_submit_button("Show this pin on map", use_container_width=True)
-        if pin_submitted:
-            st.session_state.careloop_manual_pin = {"lat": float(manual_lat), "lon": float(manual_lon)}
-        pin = st.session_state.get("careloop_manual_pin")
-        if pin:
-            lat, lon = pin["lat"], pin["lon"]
-            st.markdown("### 📌 Selected map pin")
-            st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
-            manual_map_data = json.dumps({"lat": lat, "lon": lon}).replace("</", "<\\/")
-            manual_map_html = """
-            <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-            <style>html,body,#map{height:100%;margin:0}</style></head><body><div id="map"></div>
-            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
-            const p=__PIN__; const map=L.map('map').setView([p.lat,p.lon],18);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
-            L.marker([p.lat,p.lon]).addTo(map).bindPopup('Selected location').openPopup();
-            </script></body></html>
-            """.replace("__PIN__", manual_map_data)
-            components.html(manual_map_html, height=430, scrolling=False)
-            st.markdown(f"[Open this pin in OpenStreetMap](https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon})")
-            st.markdown(f"[Open this pin in Google Maps](https://www.google.com/maps?q={lat},{lon})")
-        return
-
-    choices = [
-        f"{item.get('display_name', 'Unknown location')}"
-        for item in results
-    ]
-    selected_index = st.selectbox(
-        "Choose the correct match",
-        range(len(choices)),
-        format_func=lambda index: choices[index],
-        key="careloop_location_match",
-    )
-    selected = results[selected_index]
-    lat = float(selected["lat"])
-    lon = float(selected["lon"])
-    address = selected.get("display_name", "Address not available")
-
-    st.markdown("### 📌 Location details")
-    st.write(address)
-    st.caption(f"Coordinates: {lat:.6f}, {lon:.6f}")
-
-    # Leaflet + OpenStreetMap provides a real interactive map without a paid key.
-    map_data = json.dumps({"lat": lat, "lon": lon, "label": address}).replace("</", "<\\/")
-    map_html = """
-    <!doctype html>
-    <html><head>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-      <style>html,body,#map{height:100%;margin:0} .leaflet-container{font:14px sans-serif}</style>
-    </head><body><div id="map"></div>
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-      <script>
-        const place = __PLACE__;
-        const map = L.map('map').setView([place.lat, place.lon], 16);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          maxZoom: 19,
-          attribution: '&copy; OpenStreetMap contributors'
-        }).addTo(map);
-        L.marker([place.lat, place.lon]).addTo(map).bindPopup(
-          place.label.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
-        ).openPopup();
-      </script>
-    </body></html>
-    """.replace("__PLACE__", map_data)
-    components.html(map_html, height=430, scrolling=False)
-
-    osm_url = (
-        "https://www.openstreetmap.org/?mlat=" + str(lat)
-        + "&mlon=" + str(lon) + "#map=18/" + str(lat) + "/" + str(lon)
-    )
-    directions_url = (
-        "https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route="
-        + str(lat) + "%2C" + str(lon)
-    )
-    st.markdown(f"[Open map in OpenStreetMap]({osm_url})")
-    st.markdown(f"[Get directions]({directions_url})")
-    st.caption(
-        "Map and search data © OpenStreetMap contributors. "
-        "This free version does not guarantee photos, exact building entrances, "
-        "or results for every private house."
-    )
-
 
 def profile_page():
     st.markdown("## 👤 " + tr("profile"))
@@ -1676,7 +1505,7 @@ def main():
 
         pages = [
             tr("dashboard"), tr("companion"), tr("quiz"),
-            tr("reminders"), tr("profile"), "Find Any Location",
+            tr("reminders"), tr("profile"),
         ]
         if st.session_state.get("is_creator", False):
             pages.append(tr("user_management"))
@@ -1692,10 +1521,6 @@ def main():
             st.session_state.user = None
             st.session_state.is_creator = False
             st.rerun()
-
-    if page == "Find Any Location":
-        find_any_location_page()
-        return
 
     if not client:
         st.error(tr("api_key_missing"))
